@@ -187,7 +187,9 @@ pub fn app() -> Router {
 
 pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::error::Error>> {
     let db = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(config.db_max_connections)
+        .min_connections(config.db_min_connections)
+        .acquire_timeout(std::time::Duration::from_secs(config.db_acquire_timeout_secs))
         .connect(&config.database_url)
         .await?;
     let wallet_encryption_key = blockchain::wallet_crypto::parse_key(config.wallet_encryption_key.as_str())?;
@@ -255,6 +257,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route(
             "/payment-requests/{id}/cancel",
             axum::routing::post(api::payment_requests::cancel),
+        )
+        .route(
+            "/payment-requests/{id}/status",
+            axum::routing::get(api::payment_requests::status),
         )
         .route("/admin", axum::routing::get(api::admin::dashboard))
         .route("/admin/overview", axum::routing::get(api::admin::overview))

@@ -253,6 +253,42 @@ fn render_qr_png(contents: &str, size: u32) -> ApiResult<Vec<u8>> {
     Ok(response)
 }
 
+/// Minimal, status-only view for high-frequency polling. Deliberately omits
+/// `amount_stroops`, `address`, `sep7_uri`, etc. to keep the payload small.
+#[derive(Serialize)]
+pub struct PaymentRequestStatusView {
+    pub id: Uuid,
+    pub status: String,
+    /// The schema has no dedicated `paid_at` column, so we surface the row's
+    /// `updated_at` when the request is `paid` and `None` otherwise.
+    pub paid_at: Option<DateTime<Utc>>,
+}
+
+/// Public (no auth), like `get`: a wallet or merchant frontend can poll this
+/// cheaply without pulling the full request object.
+pub async fn get_status(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<PaymentRequestStatusView>> {
+    let pr = payment_requests::payment_request_by_id(&state.db, id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| not_found(ErrorCode::PaymentRequestNotFound, "payment request not found"))?;
+
+    let status = effective_status(&pr.status, pr.expires_at);
+    let paid_at = if status == "paid" {
+        Some(pr.updated_at)
+    } else {
+        None
+    };
+
+    Ok(Json(PaymentRequestStatusView {
+        id: pr.id,
+        status,
+        paid_at,
+    }))
+}
+
 pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,

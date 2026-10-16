@@ -324,6 +324,7 @@ async fn payment_request_marked_paid_on_memo_correlated_deposit() {
 }
 
 #[tokio::test]
+async fn payment_request_status_endpoint_is_lightweight_and_public() {
 async fn payment_after_expiry_is_not_correlated_to_the_request() {
 async fn expired_payment_request_is_not_matched_by_deposit_memo() {
 async fn payment_request_memos_are_unique_and_fit_a_text_memo() {
@@ -332,6 +333,10 @@ async fn amount_stroops_rejects_float_string_and_negative() {
         return;
     };
     let app = aframp::router(state.clone());
+    let (token, _) = ensure_merchant(&app, "pr_status").await;
+    create_wallet(&app, &token).await;
+
+    let (status, created) = send(
     let (token, _) = ensure_merchant(&app, "pr_expired_pay").await;
     create_wallet(&app, &token).await;
 
@@ -367,6 +372,10 @@ async fn amount_stroops_rejects_float_string_and_negative() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "create failed: {created}");
+    let id = created["id"].as_str().unwrap();
+
+    // Poll with NO auth token — must be public like the parent endpoint.
+    let (status, body) = send(
     let id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
     let memo = created["memo"].as_str().unwrap();
 
@@ -610,6 +619,34 @@ async fn payment_request_cancel_expired_returns_409() {
         None,
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "public status fetch failed: {body}");
+    assert_eq!(body["id"], created["id"]);
+    assert_eq!(body["status"], "pending");
+    assert!(body["paid_at"].is_null(), "unpaid request should have a null paid_at");
+    // The whole point of this endpoint: no bulky fields.
+    assert!(body.get("amount_stroops").is_none(), "status payload must omit amount_stroops");
+    assert!(body.get("address").is_none(), "status payload must omit address");
+    assert!(body.get("sep7_uri").is_none(), "status payload must omit sep7_uri");
+
+    // Unknown ids should 404 rather than leak anything.
+    let missing = uuid::Uuid::new_v4();
+    let (status, _) = send(
+        app.clone(),
+        "GET",
+        &format!("/payment-requests/{missing}/status"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Now simulate the memo-correlated deposit marking it paid, exactly as the
+    // existing paid-flow test does.
+    let id_uuid: uuid::Uuid = id.parse().unwrap();
+    let memo = created["memo"].as_str().unwrap();
+    let wallet_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT wallet_id FROM payment_requests WHERE id = $1")
+            .bind(id_uuid)
     assert_eq!(status, StatusCode::OK, "status poll failed: {body}");
     assert_eq!(body["status"], "pending");
     assert!(body.get("paid_at").is_none() || body["paid_at"].is_null());
@@ -682,6 +719,12 @@ async fn payment_request_cancel_paid_returns_409() {
     let pending = aframp::services::payment_requests::find_pending_by_wallet_and_memo(&state.db, wallet_id, memo)
         .await
         .unwrap();
+    assert!(pending.is_some(), "should find the pending request by wallet_id + memo");
+
+    let fake_payment_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO payments (id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset, network, status)
+         VALUES ($1, $2, $3, 'PLACEHOLDER', $4, 25000000, 'XLM', 'stellar', 'confirmed')",
     assert!(pending.is_none(), "an expired request must not be matched to a deposit");
 
     let (status, fetched) = send(app.clone(), "GET", &format!("/payment-requests/{id}"), None, None).await;
@@ -720,6 +763,7 @@ async fn payment_request_cancel_paid_returns_409() {
     .bind(fake_payment_id)
     .bind(created["merchant_id"].as_str().unwrap().parse::<uuid::Uuid>().unwrap())
     .bind(wallet_id)
+    .bind(format!("test_tx_status_{memo}"))
     .bind(format!("test_tx_cancel_{memo}"))
     .bind(format!("status_tx_{id}"))
     .execute(&state.db)
@@ -751,6 +795,9 @@ async fn payment_request_cancel_paid_returns_409() {
         None,
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "status fetch after payment failed: {body}");
+    assert_eq!(body["status"], "paid");
+    assert!(body["paid_at"].is_string(), "paid request should expose a paid_at timestamp");
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "paid");
     assert!(
