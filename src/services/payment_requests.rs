@@ -13,6 +13,10 @@ const MAX_EXPIRY_SECS: i64 = 24 * 60 * 60;
 pub enum PaymentRequestError {
     #[error("amount_stroops must be positive")]
     InvalidAmount,
+    #[error("payment request not found")]
+    NotFound,
+    #[error("payment request is not cancellable")]
+    NotCancellable,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -166,12 +170,59 @@ pub async fn find_pending_by_wallet_and_memo(
         "SELECT id, merchant_id, wallet_id, amount_stroops, asset, memo, status, payment_id,
                 expires_at, created_at, updated_at
            FROM payment_requests
-          WHERE wallet_id = $1 AND memo = $2 AND status = 'pending'",
+          WHERE wallet_id = $1 AND memo = $2 AND status = 'pending'
+            AND expires_at > now()",
     )
     .bind(wallet_id)
     .bind(memo)
     .fetch_optional(db)
     .await
+}
+
+/// Cancels a pending payment request owned by `merchant_id`.
+///
+/// Only rows that are still `pending` and not past `expires_at` can be
+/// cancelled; anything else (already paid/partial/cancelled, or logically
+/// expired) is reported as [`PaymentRequestError::NotCancellable`] so the API
+/// layer can map it to a 409. A missing row (or one owned by a different
+/// merchant) yields [`PaymentRequestError::NotFound`] for a 404.
+pub async fn cancel_payment_request(
+    db: &PgPool,
+    id: Uuid,
+    merchant_id: Uuid,
+) -> Result<PaymentRequest, PaymentRequestError> {
+    let updated = sqlx::query_as::<_, PaymentRequest>(
+        "UPDATE payment_requests
+            SET status = 'cancelled', updated_at = now()
+          WHERE id = $1 AND merchant_id = $2
+            AND status = 'pending'
+            AND expires_at > now()
+          RETURNING id, merchant_id, wallet_id, amount_stroops, asset, memo, status, payment_id,
+                    expires_at, created_at, updated_at",
+    )
+    .bind(id)
+    .bind(merchant_id)
+    .fetch_optional(db)
+    .await?;
+
+    if let Some(request) = updated {
+        return Ok(request);
+    }
+
+    // Nothing was updated: distinguish "doesn't exist / not yours" from
+    // "exists but can't be cancelled right now".
+    let existing = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM payment_requests WHERE id = $1 AND merchant_id = $2",
+    )
+    .bind(id)
+    .bind(merchant_id)
+    .fetch_optional(db)
+    .await?;
+
+    match existing {
+        Some(_) => Err(PaymentRequestError::NotCancellable),
+        None => Err(PaymentRequestError::NotFound),
+    }
 }
 
 pub async fn mark_paid(db: &PgPool, id: Uuid, payment_id: Uuid) -> Result<(), sqlx::Error> {

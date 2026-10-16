@@ -91,6 +91,10 @@ pub fn router(state: AppState) -> axum::Router {
             "/payment-requests/{id}",
             axum::routing::get(api::payment_requests::get),
         )
+        .route(
+            "/payment-requests/{id}/cancel",
+            axum::routing::post(api::payment_requests::cancel),
+        )
         .route("/admin", axum::routing::get(api::admin::dashboard))
         .route("/admin/overview", axum::routing::get(api::admin::overview))
         .route("/admin/merchants", axum::routing::get(api::admin::merchants))

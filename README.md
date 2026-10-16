@@ -56,7 +56,6 @@ This section is deliberately literal: everything marked ✅ has been exercised e
 | TLS | The server speaks plain HTTP by design and must run behind a TLS-terminating reverse proxy. Deployed without one, passwords cross the network in cleartext and no amount of hashing helps — the attacker sees the password before it is hashed. See [Deploying behind TLS](#deploying-behind-tls) |
 | Login rate limiting | Nothing throttles password guessing against `/login` yet |
 | Token revocation | `POST /logout` clears the browser cookie, but a JWT already copied elsewhere stays valid for its full 24h. No revocation list, no refresh rotation |
-| `src/stellar/mod.rs` | Vestigial stub from an earlier, abandoned design (single system wallet + memo-based correlation). Not compiled into the binary's active module tree in any meaningful way, superseded by the per-wallet design in `src/blockchain/`. Left in place as known cleanup debt rather than silently deleted. |
 
 See **[`PRD.md`](PRD.md)** for the full open-decisions list (payout provider choice, cNGN issuer sourcing, confirmation policy) and roadmap.
 
@@ -272,7 +271,6 @@ src/
   models/      Request/response and row types
   services/    Business logic (users, wallets, balances, payments, payment_requests, withdrawals)
   payments/    PaymentProvider abstraction — real PaystackProvider + a MockProvider for tests
-  stellar/     Vestigial unused stub from an earlier design — see Status
 migrations/    SQL schema migrations (sqlx)
 tests/         Integration tests (auth, wallet, payment request, withdrawal flows)
 examples/      prove_payment_loop.rs — end-to-end demo harness (real testnet payment)

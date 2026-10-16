@@ -151,6 +151,8 @@ No auth. Verifies the password. If the account has a verified phone number, this
 
 Errors: `401` for both a wrong password and an unknown email — deliberately indistinguishable, so don't build a "no such account" message from it. `429` on the same resend rules as signup.
 
+**Rate limited.** `POST /login` is throttled per email: **max 10 attempts per 15 minutes**. Every request counts toward the window, whether the password is right or wrong. When the limit is exceeded the endpoint returns `429 Too Many Requests` with a `Retry-After` header (seconds until the oldest attempt leaves the window) and `{"error":"too many login attempts, try again later","code":"TOO_MANY_REQUESTS"}`. Back off for the number of seconds in `Retry-After`; don't auto-retry, and don't treat it as a bad password.
+
 ### `POST /verify-otp`
 No auth. The **only** endpoint that ever issues a session, reached from either a signup or a login challenge.
 
@@ -412,7 +414,7 @@ Worth knowing before you design around them:
 - **No websockets / SSE.** Payment status is poll-only.
 - **No refresh tokens.** A 24h expiry means a re-login, not a silent refresh.
 - **No token revocation.** `POST /logout` clears the browser's cookie; it cannot invalidate a JWT that has already been copied somewhere else.
-- **No rate limiting on the password check itself.** OTP sends are throttled (60s cooldown, 5/hour per phone), but nothing yet stops repeated wrong-password guesses against `/login` before it ever gets to that step.
+- **No distributed rate limiting.** `/login` is throttled per email (10 attempts / 15 min) using an in-memory sliding window, so the limit is per-process — a multi-instance deployment needs a shared store (e.g. Redis) before the limit is global.
 - **No cursor pagination.** `limit` only, capped at 200.
 - **No cancel/delete on payment requests.** They can only expire naturally.
 - **No `PATCH`/`DELETE` anywhere** — and CORS only allows `GET`/`POST`, so adding one needs a server change too.

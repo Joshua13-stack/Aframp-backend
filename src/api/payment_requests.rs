@@ -5,7 +5,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
-use crate::error::{bad_request, internal, not_found, ApiResult, ErrorCode};
+use crate::error::{bad_request, conflict, internal, not_found, ApiResult, ErrorCode};
 use crate::models::{CreatePaymentRequestRequest, PaymentRequest};
 use crate::pagination::{Cursor, Page};
 use crate::services::{payment_requests, wallets};
@@ -66,6 +66,47 @@ pub async fn get(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<PaymentRequestView>> {
     let pr = payment_requests::payment_request_by_id(&state.db, id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| not_found(ErrorCode::PaymentRequestNotFound, "payment request not found"))?;
+
+    let wallet = wallets::wallet_by_id(&state.db, pr.wallet_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| internal("payment request references a missing wallet"))?;
+
+    Ok(Json(to_view(&pr, &wallet.address, &wallet.network)))
+}
+
+pub async fn cancel(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<PaymentRequestView>> {
+    let merchant_id = auth
+        .merchant_id
+        .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "no merchant associated with this account"))?;
+
+    let pr = payment_requests::payment_request_by_id(&state.db, id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| not_found(ErrorCode::PaymentRequestNotFound, "payment request not found"))?;
+
+    // A request belonging to another merchant is indistinguishable from a
+    // missing one, so we don't leak its existence.
+    if pr.merchant_id != merchant_id {
+        return Err(not_found(ErrorCode::PaymentRequestNotFound, "payment request not found"));
+    }
+
+    let status = effective_status(&pr.status, pr.expires_at);
+    if status != "pending" {
+        return Err(conflict(
+            ErrorCode::PaymentRequestNotCancellable,
+            "only pending payment requests can be cancelled",
+        ));
+    }
+
+    let pr = payment_requests::cancel_payment_request(&state.db, id)
         .await
         .map_err(internal)?
         .ok_or_else(|| not_found(ErrorCode::PaymentRequestNotFound, "payment request not found"))?;
