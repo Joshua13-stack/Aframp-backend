@@ -335,6 +335,54 @@ async fn login_wrong_password_unauthorized() {
 }
 
 #[tokio::test]
+async fn login_rate_limit_429_after_ten_failed_attempts() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let (email, _, _) = signup_and_verify(&app, "ratelimit").await;
+
+    // The first 10 failed attempts are answered normally (401), not throttled.
+    for attempt in 0..10 {
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            "/login",
+            None,
+            Some(json!({ "email": email, "password": "not-the-password" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} should be a plain auth failure: {body}"
+        );
+    }
+
+    // The 11th attempt within the window is throttled.
+    let (status, body) = send(
+        app.clone(),
+        "POST",
+        "/login",
+        None,
+        Some(json!({ "email": email, "password": "not-the-password" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "expected rate limit: {body}");
+    assert_eq!(body["code"], "TOO_MANY_REQUESTS");
+
+    // Even the correct password is refused while the limit is in force.
+    let (status, body) = send(
+        app.clone(),
+        "POST",
+        "/login",
+        None,
+        Some(json!({ "email": email, "password": "password123" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "rate limit must not be bypassable: {body}");
+}
+
+#[tokio::test]
 async fn verify_otp_wrong_code_rejected() {
     let app = app().await;
     let (email, phone_number, _) = fresh_identity("wrongcode");

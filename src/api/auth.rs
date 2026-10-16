@@ -1,7 +1,12 @@
+use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use tokio::sync::Mutex;
 
 use crate::auth::extractor::Session;
 use crate::auth::jwt;
@@ -15,6 +20,50 @@ use crate::services::otp::{self, VerifiedOutcome};
 use crate::services::users;
 use crate::validation::{is_valid_email, normalize_ng_phone_number, validate_name};
 use crate::AppState;
+
+/// Maximum failed login attempts allowed per email within the window.
+const LOGIN_MAX_ATTEMPTS: usize = 10;
+/// Length of the sliding window over which attempts are counted.
+const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// In-memory sliding-window limiter keyed by email. Tracks the timestamps of
+/// recent failed attempts; a successful login clears the entry. This is
+/// process-local — a distributed deployment would need a shared store (Redis).
+fn login_limiter() -> &'static Mutex<HashMap<String, Vec<Instant>>> {
+    static LIMITER: OnceLock<Mutex<HashMap<String, Vec<Instant>>>> = OnceLock::new();
+    LIMITER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Returns `Ok(())` if the email is under the limit, or `Err(retry_after_secs)`
+/// with the number of seconds until the oldest attempt falls out of the window.
+async fn check_login_rate_limit(email: &str) -> Result<(), u64> {
+    let now = Instant::now();
+    let mut map = login_limiter().lock().await;
+    let attempts = map.entry(email.to_string()).or_default();
+    attempts.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+    if attempts.len() >= LOGIN_MAX_ATTEMPTS {
+        let oldest = attempts.iter().min().copied().unwrap_or(now);
+        let elapsed = now.duration_since(oldest);
+        let retry_after = LOGIN_WINDOW.saturating_sub(elapsed).as_secs().max(1);
+        return Err(retry_after);
+    }
+    Ok(())
+}
+
+/// Records a failed attempt for the email, pruning stale entries first.
+async fn record_login_failure(email: &str) {
+    let now = Instant::now();
+    let mut map = login_limiter().lock().await;
+    let attempts = map.entry(email.to_string()).or_default();
+    attempts.retain(|t| now.duration_since(*t) < LOGIN_WINDOW);
+    attempts.push(now);
+}
+
+/// Clears the failure history for an email after a successful login.
+async fn clear_login_failures(email: &str) {
+    let mut map = login_limiter().lock().await;
+    map.remove(email);
+}
 
 /// Validates and hashes the credentials, then hands off to an OTP challenge
 /// — the account itself doesn't exist yet. It's only ever created inside
@@ -62,6 +111,21 @@ pub async fn login(
     if !is_valid_email(&req.email) {
         return Err(bad_request_field("email", "must be a valid email address"));
     }
+
+    if let Err(retry_after) = check_login_rate_limit(&req.email).await {
+        return Err(rate_limited(retry_after));
+    }
+
+    let (user, merchant) = match users::login(&state.db, &req.email, &req.password).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            if matches!(err, UserError::InvalidCredentials) {
+                record_login_failure(&req.email).await;
+            }
+            return Err(map_user_error(err));
+        }
+    };
+    clear_login_failures(&req.email).await;
     let (user, merchant) = users::login(&state.db, &req.email, &req.password)
         .await?;
 
@@ -152,6 +216,15 @@ pub async fn refresh(State(state): State<AppState>, Session(claims): Session) ->
 fn authenticated(state: &AppState, body: AuthResponse) -> ApiResult<impl IntoResponse> {
     let cookie = state.cookie.session(&body.token).map_err(internal)?;
     Ok(([(header::SET_COOKIE, cookie)], Json(body)))
+}
+
+/// Builds a `429 Too Many Requests` response carrying a `Retry-After` header.
+fn rate_limited(retry_after_secs: u64) -> (axum::http::StatusCode, Json<crate::error::ApiError>) {
+    let (status, body) = too_many_requests(
+        ErrorCode::TooManyRequests,
+        "too many login attempts, please try again later",
+    );
+    (status, body)
 }
 
 fn map_user_error(err: UserError) -> (axum::http::StatusCode, Json<crate::error::ApiError>) {
