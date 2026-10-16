@@ -116,11 +116,20 @@ impl AppConfig {
             (None, None)
         };
 
+        let jwt_secret = env("JWT_SECRET")?;
+        require_min_len("JWT_SECRET", &jwt_secret, MIN_SECRET_LEN)?;
+        let webhook_secret = env("WEBHOOK_SECRET")?;
+        require_min_len("WEBHOOK_SECRET", &webhook_secret, MIN_SECRET_LEN)?;
+        let wallet_encryption_key = env("WALLET_ENCRYPTION_KEY")?;
+        require_min_len("WALLET_ENCRYPTION_KEY", &wallet_encryption_key, MIN_SECRET_LEN)?;
+        let otp_hmac_secret = env("OTP_HMAC_SECRET")?;
+        require_min_len("OTP_HMAC_SECRET", &otp_hmac_secret, MIN_SECRET_LEN)?;
+
         Ok(Self {
             database_url: env("DATABASE_URL")?,
             bind_addr: std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into()),
-            jwt_secret: SecretString::new(env("JWT_SECRET")?),
-            webhook_secret: SecretString::new(env("WEBHOOK_SECRET")?),
+            jwt_secret: SecretString::new(jwt_secret),
+            webhook_secret: SecretString::new(webhook_secret),
             stellar_system_wallet: Arc::new(env("STELLAR_SYSTEM_WALLET_ADDRESS")?),
             stellar_horizon_url: std::env::var("STELLAR_HORIZON_URL")
                 .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".into()),
@@ -128,9 +137,9 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
-            wallet_encryption_key: SecretString::new(env("WALLET_ENCRYPTION_KEY")?),
+            wallet_encryption_key: SecretString::new(wallet_encryption_key),
             paystack_secret_key: SecretString::new(env("PAYSTACK_SECRET_KEY")?),
-            otp_hmac_secret: SecretString::new(env("OTP_HMAC_SECRET")?),
+            otp_hmac_secret: SecretString::new(otp_hmac_secret),
             otp_provider,
             termii_api_key,
             termii_sender_id,
@@ -148,8 +157,22 @@ impl AppConfig {
     }
 }
 
+/// Minimum length, in bytes, required for every HMAC/encryption secret.
+/// Shorter keys are trivially brute-forceable, so we refuse to start.
+pub const MIN_SECRET_LEN: usize = 32;
+
 fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is required"))
+}
+
+fn require_min_len(name: &str, value: &str, min: usize) -> Result<(), String> {
+    if value.len() < min {
+        return Err(format!(
+            "{name} must be at least {min} bytes long, got {} bytes; generate one with `openssl rand -hex 32`",
+            value.len()
+        ));
+    }
+    Ok(())
 }
 
 fn flag(name: &str, default: bool) -> Result<bool, String> {
@@ -181,6 +204,20 @@ mod tests {
         let display_str = format!("{}", secret);
         assert_eq!(display_str, "[REDACTED]");
         assert!(!display_str.contains("my-secret-key"));
+    }
+
+    #[test]
+    fn require_min_len_rejects_short_secret() {
+        let err = require_min_len("JWT_SECRET", "abc", MIN_SECRET_LEN)
+            .expect_err("a 3-byte secret must be rejected");
+        assert!(err.contains("JWT_SECRET"), "error should name the variable: {err}");
+        assert!(err.contains("32"), "error should state the minimum: {err}");
+    }
+
+    #[test]
+    fn require_min_len_accepts_valid_secret() {
+        let secret = "a".repeat(MIN_SECRET_LEN);
+        assert!(require_min_len("JWT_SECRET", &secret, MIN_SECRET_LEN).is_ok());
     }
 
     #[test]

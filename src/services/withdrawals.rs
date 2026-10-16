@@ -8,6 +8,28 @@ use crate::payments::{PaymentProvider, PayoutRequest};
 /// cNGN is pegged 1:1 to NGN, so 1 kobo = 100,000 stroops.
 const STROOPS_PER_KOBO: i64 = 100_000;
 
+/// Maps a Paystack transfer status onto the internal `withdrawals.status`
+/// set, which is constrained to `('pending', 'processing', 'completed',
+/// 'failed')`. Paystack can return values outside that set (e.g. `"otp"` for
+/// live-mode OTP-required transfers, `"reversed"`, `"abandoned"`), and binding
+/// them directly would violate the CHECK constraint and leave the row stuck in
+/// `pending` with provider info but no status update.
+fn map_paystack_status(status: &str) -> &'static str {
+    match status.to_ascii_lowercase().as_str() {
+        "success" | "completed" => "completed",
+        "pending" | "ongoing" | "queued" | "received" => "pending",
+        "otp" | "processing" | "sent" | "sending" => "processing",
+        "failed" | "reversed" | "abandoned" | "cancelled" | "canceled" => "failed",
+        other => {
+            tracing::warn!(
+                paystack_status = other,
+                "unknown Paystack transfer status; defaulting to 'processing'"
+            );
+            "processing"
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WithdrawalError {
     #[error("insufficient available balance")]
@@ -103,7 +125,7 @@ pub async fn create_withdrawal(
             .bind(w.id)
             .bind(&result.provider)
             .bind(&result.provider_reference)
-            .bind(&result.status)
+            .bind(map_paystack_status(&result.status))
             .fetch_one(db)
             .await
             .map_err(WithdrawalError::Database)

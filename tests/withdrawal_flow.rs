@@ -52,6 +52,36 @@ impl PaymentProvider for TimeoutProvider {
     }
 }
 
+/// Simulates Paystack returning an `otp` status, which is not one of the
+/// internal `withdrawals.status` values. The service must map it to a valid
+/// internal status (`processing`) rather than writing it verbatim.
+struct OtpStatusProvider;
+
+#[async_trait]
+impl PaymentProvider for OtpStatusProvider {
+    async fn create_payout(&self, _req: &PayoutRequest) -> Result<PayoutResult, String> {
+        Ok(PayoutResult {
+            provider_reference: "ps_otp_ref".into(),
+            status: "otp".into(),
+        })
+    }
+}
+
+/// Simulates Paystack returning a status string the service has never seen
+/// before. The service must fall back to a valid internal status
+/// (`processing`) and log a warning instead of failing the DB write.
+struct UnknownStatusProvider;
+
+#[async_trait]
+impl PaymentProvider for UnknownStatusProvider {
+    async fn create_payout(&self, _req: &PayoutRequest) -> Result<PayoutResult, String> {
+        Ok(PayoutResult {
+            provider_reference: "ps_unknown_ref".into(),
+            status: "some_future_status".into(),
+        })
+    }
+}
+
 #[tokio::test]
 async fn withdrawal_insufficient_balance_rejected() {
     let Some(state) = state().await else {
@@ -316,6 +346,97 @@ async fn withdrawal_payout_failure_refunds_balance_and_records_reason() {
     assert_eq!(withdrawals.len(), 1, "the failed attempt should still leave an audit-trail row");
     assert_eq!(withdrawals[0]["status"], "failed");
     assert_eq!(withdrawals[0]["failure_reason"], "simulated provider failure");
+}
+
+#[tokio::test]
+async fn withdrawal_paystack_otp_status_maps_to_processing() {
+    let Some(mut state) = state().await else {
+        return;
+    };
+    state.payment_provider = Arc::new(OtpStatusProvider);
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "paystack_otp").await;
+
+    sqlx::query(
+        "INSERT INTO balances (merchant_id, asset, available, pending)
+         VALUES ($1::uuid, 'cNGN', 5_000_000, 0)",
+    )
+    .bind(&merchant_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (status, json) = send(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(json!({
+            "amount_stroops": 2_000_000,
+            "asset": "cNGN",
+            "bank_code": "058",
+            "account_number": "0123456789"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "withdraw failed: {json}");
+
+    // The provider returned "otp", which is not a valid internal status.
+    // The row must have been updated to a valid internal status instead of
+    // tripping the CHECK constraint.
+    let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let withdrawals = json.as_array().unwrap();
+    assert_eq!(withdrawals.len(), 1);
+    assert_eq!(
+        withdrawals[0]["status"], "processing",
+        "Paystack 'otp' should map to internal 'processing'"
+    );
+}
+
+#[tokio::test]
+async fn withdrawal_paystack_unknown_status_falls_back_to_processing() {
+    let Some(mut state) = state().await else {
+        return;
+    };
+    state.payment_provider = Arc::new(UnknownStatusProvider);
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "paystack_unknown").await;
+
+    sqlx::query(
+        "INSERT INTO balances (merchant_id, asset, available, pending)
+         VALUES ($1::uuid, 'cNGN', 5_000_000, 0)",
+    )
+    .bind(&merchant_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (status, json) = send(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(json!({
+            "amount_stroops": 2_000_000,
+            "asset": "cNGN",
+            "bank_code": "058",
+            "account_number": "0123456789"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "withdraw failed: {json}");
+
+    // An unrecognized provider status must not cause a constraint violation;
+    // the service should warn and default to "processing".
+    let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let withdrawals = json.as_array().unwrap();
+    assert_eq!(withdrawals.len(), 1);
+    assert_eq!(
+        withdrawals[0]["status"], "processing",
+        "unknown provider status should fall back to internal 'processing'"
+    );
 }
 
 #[tokio::test]

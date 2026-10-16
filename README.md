@@ -169,12 +169,22 @@ The Worker has a five-minute Cron Trigger that calls `/health`. This keeps the c
 
 ### Running tests
 
-Integration tests need a separate database, and **silently skip with a false "ok" if it isn't configured** — this bit us during development (a full green `cargo test` run had actually tested nothing). Always set `TEST_DATABASE_URL` before trusting the result:
+Integration tests need a separate database. When `TEST_DATABASE_URL` is not set, tests **no longer pass silently** — each one prints `skipping: TEST_DATABASE_URL not set` to stderr and exits without exercising anything, so a green run with no database configured is visibly a run of skips, not a run of passes. Always set `TEST_DATABASE_URL` before trusting the result:
 
 ```bash
 docker exec -i aframp-postgres psql -U postgres -c "CREATE DATABASE aframp_test;"
 TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/aframp_test cargo test
 ```
+
+To confirm tests actually ran (rather than skipped), look for the `skipping: TEST_DATABASE_URL not set` lines — if any appear, the run exercised nothing. CI enforces this: the workflow asserts `TEST_DATABASE_URL` is set before running tests and fails loudly otherwise.
+
+Tests that require a database are marked `#[ignore]` so they don't masquerade as passing when the environment isn't configured. Run them explicitly with:
+
+```bash
+cargo test -q --ignored
+```
+
+`-q` keeps the output to the test results, and `--ignored` runs only the ignored (database-backed) tests — the same set CI runs once `TEST_DATABASE_URL` is present.
 
 ## API reference
 

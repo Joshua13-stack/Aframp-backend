@@ -38,6 +38,7 @@ paths:
           content:
             text/plain:
               schema: { type: string, example: aframp }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /health:
     get:
@@ -46,6 +47,7 @@ paths:
       security: []
       responses:
         '204': { description: Service is up (empty body) }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /signup:
     post:
@@ -68,18 +70,27 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OtpChallengeResponse' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400':
+          description: >
+            INVALID_PARAMETERS — malformed body, invalid email, password shorter
+            than 8 characters, or an unparseable phone_number.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
         '409':
-          description: Email or phone already registered to a verified account
+          description: >
+            EMAIL_TAKEN or PHONE_TAKEN — already registered to a verified account.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429':
-          description: OTP resend cooldown or hourly cap hit
+          description: >
+            TOO_MANY_REQUESTS — OTP resend cooldown or hourly cap hit.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /login:
     post:
@@ -107,13 +118,21 @@ paths:
                 oneOf:
                   - $ref: '#/components/schemas/OtpChallengeResponse'
                   - $ref: '#/components/schemas/AuthResponse'
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
-        '429':
-          description: OTP resend cooldown or hourly cap hit
+        '401':
+          description: >
+            INVALID_CREDENTIALS — wrong password or unknown email, deliberately
+            indistinguishable. Also USER_NOT_FOUND in the same shape.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429':
+          description: >
+            TOO_MANY_REQUESTS — OTP resend cooldown or hourly cap hit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /verify-otp:
     post:
@@ -138,7 +157,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AuthResponse' }
         '400':
-          description: OTP_INVALID, OTP_EXPIRED, or OTP_LOCKED
+          description: >
+            INVALID_PARAMETERS (malformed body), OTP_INVALID, OTP_EXPIRED, or
+            OTP_LOCKED (too many wrong attempts).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
@@ -148,11 +169,19 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
         '409':
-          description: Email or phone was taken by someone else between signup and verification
+          description: >
+            EMAIL_TAKEN or PHONE_TAKEN — taken by someone else between signup
+            and verification.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '429':
+          description: TOO_MANY_REQUESTS — OTP verification rate limit hit.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /logout:
     post:
@@ -170,6 +199,7 @@ paths:
             Set-Cookie:
               schema: { type: string }
               description: aframp_session with Max-Age=0
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /me:
     get:
@@ -184,8 +214,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Me' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '401':
+          description: >
+            INVALID_CREDENTIALS — missing, malformed, or expired token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '404':
+          description: USER_NOT_FOUND — the token's user no longer exists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /wallet/create:
     post:
@@ -206,9 +246,20 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Wallet' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '400':
+          description: >
+            INVALID_PARAMETERS (malformed body) or MERCHANT_NOT_FOUND — the
+            account has no merchant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '401':
+          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /wallet:
     get:
@@ -221,11 +272,18 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Wallet' }
         '400':
-          description: No wallet created yet — run onboarding
+          description: >
+            WALLET_NOT_FOUND — no wallet created yet, run onboarding. Also
+            MERCHANT_NOT_FOUND for an account with no merchant.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '401':
+          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /payment-requests:
     post:
@@ -245,9 +303,21 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/PaymentRequest' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '400':
+          description: >
+            INVALID_PARAMETERS (malformed body), INVALID_AMOUNT (non-positive or
+            out of range), UNSUPPORTED_ASSET (asset other than XLM/cNGN), or
+            MERCHANT_NOT_FOUND.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '401':
+          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
     get:
       tags: [Payment requests]
       summary: List the merchant's payment requests
@@ -262,8 +332,18 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/PaymentRequest' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '400':
+          description: >
+            INVALID_PARAMETERS — limit is not an integer, or MERCHANT_NOT_FOUND.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '401':
+          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /payment-requests/{id}:
     get:
@@ -285,7 +365,12 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/PaymentRequest' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '404':
+          description: PAYMENT_REQUEST_NOT_FOUND — no request with that id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /balance:
     get:
@@ -300,8 +385,18 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/Balance' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '400':
+          description: >
+            INVALID_PARAMETERS or MERCHANT_NOT_FOUND — the account has no merchant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '401':
+          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /transactions:
     get:
@@ -317,8 +412,19 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/Payment' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '400':
+          description: >
+            INVALID_PARAMETERS (bad limit) or MERCHANT_NOT_FOUND — the account
+            has no merchant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '401':
+          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /withdraw:
     post:
@@ -340,11 +446,25 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Withdrawal' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '400':
+          description: >
+            INVALID_PARAMETERS (malformed body, bad bank_code, non-10-digit
+            account_number), INVALID_AMOUNT (not a whole multiple of 100000, or
+            below Paystack's NGN 50 minimum), UNSUPPORTED_ASSET (asset other than
+            cNGN), INSUFFICIENT_BALANCE, or MERCHANT_NOT_FOUND.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '401':
+          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
         '502':
-          description: Payout provider failed; balance already refunded
+          description: >
+            PAYOUT_FAILED — payout provider failed; balance already refunded.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
@@ -363,8 +483,19 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/Withdrawal' }
-        '400': { $ref: '#/components/responses/BadRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '400':
+          description: >
+            INVALID_PARAMETERS (bad limit) or MERCHANT_NOT_FOUND — the account
+            has no merchant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '401':
+          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
 components:
   securitySchemes:
@@ -410,8 +541,17 @@ components:
           schema: { $ref: '#/components/schemas/ApiError' }
     UnsupportedMediaType:
       description: >
-        POST/PUT request carries a body but `Content-Type` is not
-        `application/json` (or a `+json` subtype)
+        INVALID_PARAMETERS — POST/PUT request carries a body but `Content-Type`
+        is not `application/json` (or a `+json` subtype)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    InternalError:
+      description: >
+        INTERNAL_ERROR — an unexpected server-side failure. Always a 500, and the
+        `error` message is always a generic, safe string; it never leaks internal
+        details, database errors, or stack traces. Treat it as retryable with
+        backoff and surface a neutral "something went wrong" message to the user.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ApiError' }
@@ -425,7 +565,43 @@ components:
         code:
           type: string
           example: INSUFFICIENT_BALANCE
-          description: "Machine-readable error code. Full catalog: INVALID_PARAMETERS, INVALID_AMOUNT, INSUFFICIENT_BALANCE, UNSUPPORTED_ASSET, PAYOUT_FAILED, EMAIL_TAKEN, PHONE_TAKEN, INVALID_CREDENTIALS, USER_NOT_FOUND, MERCHANT_NOT_FOUND, WALLET_NOT_FOUND, PAYMENT_REQUEST_NOT_FOUND, FORBIDDEN, OTP_INVALID, OTP_EXPIRED, OTP_LOCKED, OTP_CHALLENGE_NOT_FOUND, TOO_MANY_REQUESTS, INTERNAL_ERROR"
+          description: >
+            Machine-readable error code. The complete catalog of all 19 variants
+            (see the "Error Codes" section of API.md for HTTP statuses and the
+            endpoints that can return each one):
+
+
+            INVALID_PARAMETERS (400), INVALID_AMOUNT (400), INSUFFICIENT_BALANCE
+            (400), UNSUPPORTED_ASSET (400), PAYOUT_FAILED (502), EMAIL_TAKEN
+            (409), PHONE_TAKEN (409), INVALID_CREDENTIALS (401), USER_NOT_FOUND
+            (404), MERCHANT_NOT_FOUND (400), WALLET_NOT_FOUND (400),
+            PAYMENT_REQUEST_NOT_FOUND (404), FORBIDDEN (403), OTP_INVALID (400),
+            OTP_EXPIRED (400), OTP_LOCKED (400), OTP_CHALLENGE_NOT_FOUND (404),
+            TOO_MANY_REQUESTS (429), INTERNAL_ERROR (500).
+
+
+            INTERNAL_ERROR is always returned with HTTP 500 and a generic, safe
+            `error` message — it never exposes internal details.
+          enum:
+            - INVALID_PARAMETERS
+            - INVALID_AMOUNT
+            - INSUFFICIENT_BALANCE
+            - UNSUPPORTED_ASSET
+            - PAYOUT_FAILED
+            - EMAIL_TAKEN
+            - PHONE_TAKEN
+            - INVALID_CREDENTIALS
+            - USER_NOT_FOUND
+            - MERCHANT_NOT_FOUND
+            - WALLET_NOT_FOUND
+            - PAYMENT_REQUEST_NOT_FOUND
+            - FORBIDDEN
+            - OTP_INVALID
+            - OTP_EXPIRED
+            - OTP_LOCKED
+            - OTP_CHALLENGE_NOT_FOUND
+            - TOO_MANY_REQUESTS
+            - INTERNAL_ERROR
 
     SignupRequest:
       type: object
