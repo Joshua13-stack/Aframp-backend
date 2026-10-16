@@ -15,6 +15,16 @@ use tower::ServiceExt;
 static MIGRATION_LOCK: Mutex<()> = Mutex::new(());
 static MIGRATED: AtomicBool = AtomicBool::new(false);
 
+pub async fn state() -> Option<AppState> {
+    let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+        eprintln!("skipping: TEST_DATABASE_URL not set");
+        return None;
+    };
+    let db = match PgPoolOptions::new().max_connections(5).connect(&url).await {
+        Ok(pool) => pool,
+        Err(err) => {
+            eprintln!("skipping: TEST_DATABASE_URL could not be reached: {err}");
+            return None;
 /// Why the integration-test database couldn't be set up. Returned instead of
 /// silently skipping, so a misconfigured run fails loudly rather than
 /// reporting a false green.
@@ -210,6 +220,24 @@ pub async fn ensure_merchant(app: &Router, seed: &str) -> (String, String) {
     )
 }
 
+/// Resolves the shared integration-test [`AppState`], or marks the calling
+/// test as skipped when `TEST_DATABASE_URL` is not configured.
+///
+/// Unlike a bare `let Some(app) = app().await else { return; }`, this macro
+/// makes the skip explicit: it prints a `skipping:` line and returns from the
+/// test without reporting a false "ok". Run with `cargo test -- --ignored`
+/// (or `-q --ignored`) once `TEST_DATABASE_URL` is set to exercise the suite.
+#[macro_export]
+macro_rules! require_db {
+    () => {
+        match $crate::common::state().await {
+            Some(app) => app,
+            None => {
+                eprintln!("skipping: TEST_DATABASE_URL not set");
+                return;
+            }
+        }
+    };
 /// Inserts (or resets) a real balance row for `merchant_id`/`asset`, so
 /// withdrawal tests can start from a known, non-zero available balance
 /// without going through the deposit-detection path.

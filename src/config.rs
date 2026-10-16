@@ -168,6 +168,15 @@ impl AppConfig {
             return Err("MAX_REQUEST_BODY_BYTES must be greater than 0".into());
         }
 
+        let jwt_secret = env("JWT_SECRET")?;
+        require_min_len("JWT_SECRET", &jwt_secret, MIN_SECRET_LEN)?;
+        let webhook_secret = env("WEBHOOK_SECRET")?;
+        require_min_len("WEBHOOK_SECRET", &webhook_secret, MIN_SECRET_LEN)?;
+        let wallet_encryption_key = env("WALLET_ENCRYPTION_KEY")?;
+        require_min_len("WALLET_ENCRYPTION_KEY", &wallet_encryption_key, MIN_SECRET_LEN)?;
+        let otp_hmac_secret = env("OTP_HMAC_SECRET")?;
+        require_min_len("OTP_HMAC_SECRET", &otp_hmac_secret, MIN_SECRET_LEN)?;
+
         Ok(Self {
             database_url: env("DATABASE_URL")?,
             db_max_connections: std::env::var("DB_MAX_CONNECTIONS")
@@ -183,6 +192,8 @@ impl AppConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
             bind_addr: std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into()),
+            jwt_secret: SecretString::new(jwt_secret),
+            webhook_secret: SecretString::new(webhook_secret),
             jwt_secret: secret("JWT_SECRET")?,
             webhook_secret: secret("WEBHOOK_SECRET")?,
             jwt_secret: SecretString::new(secret_min32("JWT_SECRET")?),
@@ -194,6 +205,9 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            wallet_encryption_key: SecretString::new(wallet_encryption_key),
+            paystack_secret_key: SecretString::new(env("PAYSTACK_SECRET_KEY")?),
+            otp_hmac_secret: SecretString::new(otp_hmac_secret),
             stellar_poll_concurrency,
             wallet_encryption_key: SecretString::new(env("WALLET_ENCRYPTION_KEY")?),
             paystack_secret_key: SecretString::new(env("PAYSTACK_SECRET_KEY")?),
@@ -217,6 +231,8 @@ impl AppConfig {
     }
 }
 
+/// Minimum length, in bytes, required for every HMAC/encryption secret.
+/// Shorter keys are trivially brute-forceable, so we refuse to start.
 /// Minimum number of characters required for HMAC/signing secrets.
 /// HMAC-SHA256 security degrades significantly with keys shorter than
 /// 32 bytes; this constant makes the threshold explicit and testable.
@@ -226,6 +242,14 @@ fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is required"))
 }
 
+fn require_min_len(name: &str, value: &str, min: usize) -> Result<(), String> {
+    if value.len() < min {
+        return Err(format!(
+            "{name} must be at least {min} bytes long, got {} bytes; generate one with `openssl rand -hex 32`",
+            value.len()
+        ));
+    }
+    Ok(())
 /// Read a required secret from the environment and enforce a minimum length.
 ///
 /// A secret that is too short is rejected at startup with a clear error
@@ -370,6 +394,20 @@ mod tests {
         let err = AppConfig::from_env().unwrap_err();
         assert!(err.contains("JWT_SECRET"), "error must identify the variable: {err}");
         assert!(err.contains("31"), "error should report the actual length: {err}");
+    }
+
+    #[test]
+    fn require_min_len_rejects_short_secret() {
+        let err = require_min_len("JWT_SECRET", "abc", MIN_SECRET_LEN)
+            .expect_err("a 3-byte secret must be rejected");
+        assert!(err.contains("JWT_SECRET"), "error should name the variable: {err}");
+        assert!(err.contains("32"), "error should state the minimum: {err}");
+    }
+
+    #[test]
+    fn require_min_len_accepts_valid_secret() {
+        let secret = "a".repeat(MIN_SECRET_LEN);
+        assert!(require_min_len("JWT_SECRET", &secret, MIN_SECRET_LEN).is_ok());
     }
 
     #[test]

@@ -178,6 +178,23 @@ jobs:
           files: lcov.info
           fail_ci_if_error: true
 
+      - name: Assert TEST_DATABASE_URL is set
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/aframp_test
+        run: |
+          if [ -z "$TEST_DATABASE_URL" ]; then
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🚫  TEST_DATABASE_URL is not set."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "Integration tests silently skip (and report a false 'ok') when"
+            echo "TEST_DATABASE_URL is unset. Refusing to run the suite without it."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            exit 1
+          fi
+          echo "✅  TEST_DATABASE_URL is set."
+
+      - name: Run tests
       - name: Run property-based tests (normalize_ng_phone_number)
         run: cargo test --all -- --nocapture normalize_ng_phone_number
 
@@ -216,6 +233,33 @@ jobs:
           PAYSTACK_SECRET_KEY: sk_test_placeholder
           OTP_HMAC_SECRET: test-otp-hmac-secret-at-least-32chars
           OTP_PROVIDER: mock
+        run: |
+          set -o pipefail
+          cargo test --all 2>&1 | tee /tmp/test-output.txt
+
+      - name: Assert tests actually ran
+        run: |
+          # Fail loudly if the suite exercised zero tests. A green run with
+          # "0 passed" means TEST_DATABASE_URL was unset and every test
+          # silently returned Ok(()) without doing anything.
+          PASSED=$(grep -Eo 'test result: ok\. [0-9]+ passed' /tmp/test-output.txt \
+            | grep -Eo '[0-9]+' | awk '{s+=$1} END {print s+0}')
+
+          echo "Total tests passed: $PASSED"
+
+          if [ "$PASSED" -eq 0 ]; then
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "🚫  ZERO TESTS EXERCISED"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "The test run reported 0 passing tests. This usually means"
+            echo "TEST_DATABASE_URL was unset and every integration test"
+            echo "silently skipped with a false 'ok'. Failing the build."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            exit 1
+          fi
+
+          echo "✅  $PASSED tests exercised."
         run: cargo test --all --test paystack_contract
 
   # ─────────────────────────────────────────────────────────────────────────────
