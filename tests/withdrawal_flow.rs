@@ -632,6 +632,87 @@ async fn withdrawal_invalid_account_number_refunds_balance_and_records_reason() 
 }
 
 #[tokio::test]
+async fn withdrawal_idempotency_key_returns_original_withdrawal() {
+    let Some(state) = state().await else {
+        return;
+    };
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "idempotent").await;
+
+    sqlx::query(
+        "INSERT INTO balances (merchant_id, asset, available, pending)
+         VALUES ($1::uuid, 'cNGN', 5_000_000, 0)",
+    )
+    .bind(&merchant_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let body = json!({
+        "amount_stroops": 2_000_000,
+        "asset": "cNGN",
+        "bank_code": "058",
+        "account_number": "0123456789"
+    });
+
+    let (status, first) = send_with_headers(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(body.clone()),
+        &[("Idempotency-Key", "retry-key-1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first withdraw failed: {first}");
+
+    // A retry with the same key and identical body must return the original
+    // withdrawal rather than debiting the balance a second time.
+    let (status, second) = send_with_headers(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(body.clone()),
+        &[("Idempotency-Key", "retry-key-1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "retry should return the original response: {second}");
+    assert_eq!(first["id"], second["id"], "retry must return the original withdrawal id");
+
+    let balance = sqlx::query_scalar::<_, i64>(
+        "SELECT available FROM balances WHERE merchant_id = $1::uuid AND asset = 'cNGN'",
+    )
+    .bind(&merchant_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(balance, 3_000_000, "balance should be debited exactly once");
+
+    let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json.as_array().unwrap().len(), 1, "retry must not create a second withdrawal");
+
+    // A different idempotency key is a distinct request and creates a new
+    // withdrawal.
+    let (status, third) = send_with_headers(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(body),
+        &[("Idempotency-Key", "retry-key-2")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second distinct withdraw failed: {third}");
+    assert_ne!(first["id"], third["id"], "a different key must create a new withdrawal");
+
+    let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json.as_array().unwrap().len(), 2, "distinct keys create distinct withdrawals");
+}
+
+#[tokio::test]
 async fn withdrawal_paystack_timeout_refunds_balance_and_records_reason() {
     let mut state = state().await;
     state.payment_provider = Arc::new(TimeoutProvider);

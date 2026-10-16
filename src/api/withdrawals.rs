@@ -88,6 +88,7 @@ pub async fn verify_bank(
 pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<CreateWithdrawalRequest>,
 ) -> ApiResult<Json<WithdrawalView>> {
     let merchant_id = auth.merchant_id.ok_or_else(|| {
@@ -105,6 +106,21 @@ pub async fn create(
     let merchant_id = auth
         .merchant_id
         .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "no merchant associated with this account"))?;
+    let idempotency_key = match headers.get("Idempotency-Key") {
+        Some(value) => {
+            let key = value.to_str().map_err(|_| {
+                bad_request_field("Idempotency-Key", "must be a valid ASCII string")
+            })?;
+            if key.is_empty() || key.len() > 255 {
+                return Err(bad_request_field(
+                    "Idempotency-Key",
+                    "must be a non-empty string of at most 255 characters",
+                ));
+            }
+            Some(key.to_string())
+        }
+        None => None,
+    };
 
     // Refuse if the merchant is suspended.
     let merchant = crate::services::users::merchant_by_id(&state.db, merchant_id)

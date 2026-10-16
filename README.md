@@ -110,6 +110,7 @@ Fill in `.env`:
 | `STELLAR_HORIZON_URL` | no | `https://horizon-testnet.stellar.org` | Horizon endpoint to poll |
 | `STELLAR_POLL_INTERVAL_SECS` | no | `60` | How often the deposit-detection worker polls Horizon, per wallet |
 | `PAYSTACK_SECRET_KEY` | yes | — | Paystack Dashboard → Settings → API Keys & Webhooks. `sk_test_...` for dev, `sk_live_...` only once the business is verified/activated for Transfers (see `PRD.md` §9.1) |
+| `TERMII_WEBHOOK_SECRET` | no | — | Secret used to verify the `X-Termii-Signature` header on `/webhooks/termii` (HMAC-SHA512). Set this to the webhook secret from your Termii dashboard. If absent, verification falls back to `TERMII_API_KEY` and the server logs a startup warning — see [Termii webhook](#termii-webhook) |
 | `OTP_HMAC_SECRET` | yes | — | HMAC secret used to store OTP codes securely. A bare hash of a 6-digit code is trivially reversible — this secret makes it infeasible. Generate with `openssl rand -hex 32`. Never reuse this value for anything else |
 | `OTP_PROVIDER` | no | `termii` | `mock` logs the OTP to stdout instead of sending it (read it from `cargo run` output — no Termii account needed). `termii` sends a real SMS. Always use `mock` in local dev |
 | `TERMII_API_KEY` | no | — | Termii Dashboard → API Keys. Required only when `OTP_PROVIDER=termii` |
@@ -162,6 +163,7 @@ Before deploying:
    npx wrangler secret put WALLET_ENCRYPTION_KEY
    npx wrangler secret put STELLAR_SYSTEM_WALLET_ADDRESS
    npx wrangler secret put PAYSTACK_SECRET_KEY
+   npx wrangler secret put TERMII_WEBHOOK_SECRET   # only if Termii is used in production
    npx wrangler secret put OTP_HMAC_SECRET
    # Required when OTP_PROVIDER=termii (the production default). Skip only if
    # you deliberately set OTP_PROVIDER=mock for a non-production deploy.
@@ -271,7 +273,7 @@ The `is_admin` flag is also baked into the JWT at login, so **re-login after gra
 
 Register `https://<your-deployed-host>/webhooks/termii` at [termii.com/account/webhook/config](https://termii.com/account/webhook/config) — it's one account-wide setting, not something passed per API call. Termii POSTs SMS delivery-status events (`Delivered`, `Message Failed`, `Rejected`, etc. — see [their docs](https://developers.termii.com/events-and-reports)) there, signed with `X-Termii-Signature` (HMAC-SHA512). This endpoint verifies that signature and logs the event; it doesn't yet correlate a delivery status back to the `otp_challenges` row that sent it — that'd need the provider's `message_id` captured at send time and a column to hold it, which nothing does today.
 
-**Their docs don't say which secret signs the header** — "your secret key," unspecified. This verifies against `TERMII_API_KEY`, the only secret both sides are known to share. If real Termii traffic starts failing signature checks, that assumption is the first thing to check against the dashboard.
+**Which secret signs the header:** set `TERMII_WEBHOOK_SECRET` to the webhook secret shown in your Termii dashboard, and the signature is verified against that. If `TERMII_WEBHOOK_SECRET` is unset, the server falls back to `TERMII_API_KEY` — Termii's docs only say "your secret key," unspecified — and logs a startup warning so the fallback is never silent. Prefer the dedicated secret: it keeps the API key out of the webhook path, so rotating one doesn't break the other. If real Termii traffic starts failing signature checks, confirm which secret the dashboard signs with before anything else.
 
 **Known gap since OTP shipped:** the `/admin` page's login form only knows the old one-step `/login` → cookie flow. An admin account created *before* OTP existed (no `phone_number` on the row) still logs in through it fine. An admin account with a phone number now gets a challenge response back instead of a session, and the dashboard has no code-entry step to handle that — it'll appear to fail to log in. Until the dashboard is updated, keep your admin account phone-less, or drive `/login` → `/verify-otp` manually with `curl`/Postman and paste the resulting cookie in by hand.
 

@@ -24,6 +24,7 @@ pub struct Withdrawal {
     pub bank_code: Option<String>,
     pub account_number: Option<String>,
     pub failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -75,4 +76,5 @@ pub struct NewWithdrawal {
     pub bank_code: String,
     pub account_number: String,
     pub idempotency_key: Option<String>,
+}
 }

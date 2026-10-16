@@ -37,16 +37,30 @@ pub struct TermiiWebhookEvent {
 pub struct TermiiProvider {
     api_key: String,
     sender_id: String,
+    /// Dedicated webhook signing secret (`TERMII_WEBHOOK_SECRET`). When
+    /// `None`, webhook verification falls back to `api_key` — see
+    /// [`TermiiProvider::verify_webhook_signature`].
+    webhook_secret: Option<String>,
     http: reqwest::Client,
 }
 
 impl TermiiProvider {
-    pub fn new(api_key: String, sender_id: String) -> Self {
+    /// `webhook_secret` should be the value of `TERMII_WEBHOOK_SECRET`. When
+    /// absent, webhook signature verification falls back to `api_key`; a
+    /// warning is logged so operators know the fallback is in effect.
+    pub fn new(api_key: String, sender_id: String, webhook_secret: Option<String>) -> Self {
+        if webhook_secret.is_none() {
+            tracing::warn!(
+                "TERMII_WEBHOOK_SECRET is not set; falling back to TERMII_API_KEY for Termii \
+                 webhook signature verification. Set TERMII_WEBHOOK_SECRET to decouple webhook \
+                 verification from the API key."
+            );
+        }
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .expect("failed to build Termii HTTP client");
-        Self { api_key, sender_id, http }
+        Self { api_key, sender_id, webhook_secret, http }
     }
 }
 
@@ -113,16 +127,20 @@ impl OtpProvider for TermiiProvider {
     }
 
     /// Termii signs webhook payloads as `HMAC-SHA512(secret, raw_body)`, hex
-    /// encoded, in the `X-Termii-Signature` header. Their docs say "your
-    /// secret key" without naming which one — the account API key is the
-    /// only secret both sides are known to share, so that's what's used
-    /// here. Worth double-checking against the dashboard's webhook config
-    /// page if verification ever starts failing on genuine Termii traffic.
+    /// encoded, in the `X-Termii-Signature` header.
+    ///
+    /// The signing secret is read from the `TERMII_WEBHOOK_SECRET`
+    /// environment variable (passed in via [`TermiiProvider::new`]). If that
+    /// variable is unset, verification falls back to `TERMII_API_KEY` for
+    /// backwards compatibility; a warning is emitted at construction time in
+    /// that case. Prefer setting `TERMII_WEBHOOK_SECRET` so that rotating
+    /// the API key does not invalidate webhook verification (and vice versa).
     fn verify_webhook_signature(&self, body: &[u8], signature: &str) -> bool {
         let Ok(sig_bytes) = hex::decode(signature) else {
             return false;
         };
-        let Ok(mut mac) = Hmac::<Sha512>::new_from_slice(self.api_key.as_bytes()) else {
+        let secret = self.webhook_secret.as_deref().unwrap_or(&self.api_key);
+        let Ok(mut mac) = Hmac::<Sha512>::new_from_slice(secret.as_bytes()) else {
             return false;
         };
         mac.update(body);

@@ -35,6 +35,23 @@ pub enum WithdrawalError {
     Database(#[from] sqlx::Error),
 }
 
+/// Look up a withdrawal by its idempotency key for a given merchant.
+pub async fn withdrawal_by_idempotency_key(
+    db: &PgPool,
+    merchant_id: Uuid,
+    key: &str,
+) -> Result<Option<Withdrawal>, sqlx::Error> {
+    sqlx::query_as::<_, Withdrawal>(
+        "SELECT id, merchant_id, amount_stroops, asset, status, provider,
+                provider_reference, bank_code, account_number, failure_reason,
+                idempotency_key, created_at, updated_at
+           FROM withdrawals
+          WHERE merchant_id = $1 AND idempotency_key = $2",
+    )
+    .bind(merchant_id)
+    .bind(key)
+    .fetch_optional(db)
+    .await
 /// A bank account whose ownership has been confirmed by the payout provider.
 #[derive(Debug, Clone)]
 pub struct VerifiedAccount {
@@ -145,6 +162,16 @@ pub async fn create_withdrawal_idempotent(
     }
     let amount_kobo = withdrawal.amount_stroops / STROOPS_PER_KOBO;
 
+    // Idempotency fast path: if the caller supplied a key and we've already
+    // processed it, return the original row untouched — no second debit, no
+    // second Paystack transfer.
+    if let Some(key) = withdrawal.idempotency_key.as_deref() {
+        if let Some(existing) =
+            withdrawal_by_idempotency_key(db, withdrawal.merchant_id, key).await?
+        {
+            return Ok(existing);
+        }
+    }
     // Hard requirement: resolve the account *before* debiting the balance or
     // creating the withdrawal row. A failed resolution aborts here, so no
     // funds are ever moved against an unverified account.
@@ -174,11 +201,12 @@ pub async fn create_withdrawal_idempotent(
         return Err(WithdrawalError::InsufficientBalance);
     }
 
-    let w = sqlx::query_as::<_, Withdrawal>(
+    let inserted = sqlx::query_as::<_, Withdrawal>(
         "INSERT INTO withdrawals (
              merchant_id, amount_stroops, asset, status, bank_code, account_number,
              idempotency_key
          )
+         VALUES ($1, $2, $3, 'pending', $4, $5, $6)
          VALUES ($1, $2, $3, $4, $5, $6)
          VALUES ($1, $2, $3, 'pending', $4, $5, $6)
          ON CONFLICT (merchant_id, idempotency_key) DO NOTHING
@@ -192,6 +220,26 @@ pub async fn create_withdrawal_idempotent(
     .bind(WithdrawalStatus::Pending)
     .bind(&withdrawal.bank_code)
     .bind(&withdrawal.account_number)
+    .bind(&withdrawal.idempotency_key)
+    .fetch_one(&mut *tx)
+    .await;
+
+    let w = match inserted {
+        Ok(w) => w,
+        Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
+            // Lost the race: a concurrent request with the same idempotency key
+            // committed first. Roll back our (uncommitted) debit and return the
+            // winner's row.
+            tx.rollback().await?;
+            let key = withdrawal.idempotency_key.as_deref().ok_or_else(|| {
+                WithdrawalError::Database(sqlx::Error::RowNotFound)
+            })?;
+            return withdrawal_by_idempotency_key(db, withdrawal.merchant_id, key)
+                .await?
+                .ok_or_else(|| WithdrawalError::Database(sqlx::Error::RowNotFound));
+        }
+        Err(e) => return Err(WithdrawalError::Database(e)),
+    };
     .bind(idempotency_key)
     .fetch_optional(&mut *tx)
     .await?;
@@ -462,6 +510,41 @@ pub async fn withdrawals_by_merchant(
     merchant_id: Uuid,
     limit: i64,
 ) -> Result<Vec<Withdrawal>, sqlx::Error> {
+    match cursor {
+        Some(c) => {
+            sqlx::query_as::<_, Withdrawal>(
+                "SELECT id, merchant_id, amount_stroops, asset, status, provider,
+                        provider_reference, bank_code, account_number, failure_reason,
+                        idempotency_key, created_at, updated_at
+                   FROM withdrawals
+                  WHERE merchant_id = $1
+                    AND (created_at, id) < ($2, $3)
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT $4",
+            )
+            .bind(merchant_id)
+            .bind(c.created_at)
+            .bind(c.id)
+            .bind(limit + 1)
+            .fetch_all(db)
+            .await
+        }
+        None => {
+            sqlx::query_as::<_, Withdrawal>(
+                "SELECT id, merchant_id, amount_stroops, asset, status, provider,
+                        provider_reference, bank_code, account_number, failure_reason,
+                        idempotency_key, created_at, updated_at
+                   FROM withdrawals
+                  WHERE merchant_id = $1
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT $2",
+            )
+            .bind(merchant_id)
+            .bind(limit + 1)
+            .fetch_all(db)
+            .await
+        }
+    }
     sqlx::query_as::<_, Withdrawal>(
         "SELECT id, merchant_id, amount_stroops, asset, status, provider,
                 provider_reference, bank_code, account_number, failure_reason,
