@@ -19,23 +19,42 @@ pub async fn run(state: Arc<AppState>, horizon_url: String, poll_interval_secs: 
     }
 }
 
+// Wallets are processed in keyset-paginated batches of `WALLET_BATCH_SIZE`
+// (500) to avoid materializing every Stellar wallet in memory each poll cycle.
+// Each batch issues one Horizon request for up to 500 addresses; the loop
+// continues until a batch returns fewer than `WALLET_BATCH_SIZE` rows, so the
+// expected scale limit is bounded by the number of batches rather than the
+// total wallet count.
+const WALLET_BATCH_SIZE: i64 = 500;
+
 async fn poll_once(db: &PgPool, listener: &StellarListener) -> Result<(), String> {
-    let addresses: Vec<String> = wallets::all_wallets(db)
-        .await
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|w| w.address)
-        .collect();
-    if addresses.is_empty() {
-        return Ok(());
+    let mut after_id: Option<i64> = None;
+
+    loop {
+        let batch = wallets::all_wallets_page(db, after_id, WALLET_BATCH_SIZE)
+            .await
+            .map_err(|e| e.to_string())?;
+        if batch.is_empty() {
+            break;
+        }
+
+        let batch_len = batch.len() as i64;
+        let last_id = batch.last().map(|w| w.id);
+
+        let addresses: Vec<String> = batch.into_iter().map(|w| w.address).collect();
+        let deposits = listener.fetch_deposits(&addresses).await?;
+        for deposit in deposits {
+            if let Err(err) = process_deposit(db, deposit).await {
+                tracing::warn!(error = %err, "failed to process deposit");
+            }
+        }
+
+        if batch_len < WALLET_BATCH_SIZE {
+            break;
+        }
+        after_id = last_id;
     }
 
-    let deposits = listener.fetch_deposits(&addresses).await?;
-    for deposit in deposits {
-        if let Err(err) = process_deposit(db, deposit).await {
-            tracing::warn!(error = %err, "failed to process deposit");
-        }
-    }
     Ok(())
 }
 

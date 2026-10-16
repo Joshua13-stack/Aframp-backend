@@ -81,3 +81,13 @@ CREATE TABLE webhook_events (
   received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (provider, external_id)
 );
+
+-- Issue #1207: idempotency key support for POST /withdraw.
+-- Stores the optional Idempotency-Key header supplied by the client so that
+-- retried requests return the original withdrawal instead of creating a new one.
+ALTER TABLE withdrawals ADD COLUMN idempotency_key TEXT;
+
+-- Enforce uniqueness per merchant, ignoring rows without a key.
+CREATE UNIQUE INDEX withdrawals_merchant_idempotency_key_idx
+  ON withdrawals (merchant_id, idempotency_key)
+  WHERE idempotency_key IS NOT NULL;

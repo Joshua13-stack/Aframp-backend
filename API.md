@@ -347,6 +347,18 @@ Auth required. Debits the merchant's balance and initiates a Nigerian bank payou
 | `bank_code` | yes | Paystack bank code, e.g. `058` GTBank, `999992` OPay |
 | `account_number` | yes | Exactly 10 digits (NUBAN) |
 
+**Optional `Idempotency-Key` header.** Send a unique string (a UUID is fine) with the request and a retry carrying the same key returns the **original withdrawal unchanged** — same `id`, no second balance debit, no second Paystack transfer. Keys are scoped per merchant, so two merchants can use the same key without colliding. Omit the header and the call behaves exactly as before (every request creates a new withdrawal).
+
+```bash
+curl -X POST http://127.0.0.1:3000/withdraw \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 8f14e45f-ceea-467a-9c1c-1b2f0a4d6e77" \
+  -d '{"amount_stroops":500000000,"asset":"cNGN","bank_code":"058","account_number":"0123456789"}'
+```
+
+Generate a fresh key per logical withdrawal (not per HTTP attempt) and reuse it on retries — that's what makes a network retry safe.
+
 `200` → a withdrawal object with `status`, `provider`, `provider_reference`.
 
 Validation errors (`400`): `"insufficient available balance"`, `"withdrawals are only supported for the cNGN asset"`, `"amount_stroops must be a whole number of kobo"`, `"positive amount_stroops, bank_code, and a 10-digit account_number are required"`.

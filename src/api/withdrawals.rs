@@ -1,4 +1,5 @@
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::Json;
 use serde::Deserialize;
 
@@ -19,11 +20,27 @@ pub struct ListParams {
 pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<CreateWithdrawalRequest>,
 ) -> ApiResult<Json<Withdrawal>> {
     let merchant_id = auth
         .merchant_id
         .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "no merchant associated with this account"))?;
+    let idempotency_key = match headers.get("Idempotency-Key") {
+        Some(value) => {
+            let key = value.to_str().map_err(|_| {
+                bad_request_field("Idempotency-Key", "must be a valid ASCII string")
+            })?;
+            if key.is_empty() || key.len() > 255 {
+                return Err(bad_request_field(
+                    "Idempotency-Key",
+                    "must be a non-empty string of at most 255 characters",
+                ));
+            }
+            Some(key.to_string())
+        }
+        None => None,
+    };
     if req.amount_stroops <= 0 {
         return Err(bad_request_field(
             "amount_stroops",
@@ -48,6 +65,7 @@ pub async fn create(
             asset: req.asset.unwrap_or_else(|| "cNGN".into()),
             bank_code: req.bank_code,
             account_number: req.account_number,
+            idempotency_key,
         },
     )
     .await
