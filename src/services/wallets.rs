@@ -8,6 +8,8 @@ use crate::models::{NewWallet, Wallet};
 pub enum CreateWalletError {
     #[error("failed to encrypt wallet secret: {0}")]
     Encryption(String),
+    #[error("merchant already has a wallet")]
+    AlreadyExists,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -18,6 +20,16 @@ pub async fn create_wallet(
     network: &str,
     encryption_key: &[u8; 32],
 ) -> Result<Wallet, CreateWalletError> {
+    let existing = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM wallets WHERE merchant_id = $1 LIMIT 1",
+    )
+    .bind(merchant_id)
+    .fetch_optional(db)
+    .await?;
+    if existing.is_some() {
+        return Err(CreateWalletError::AlreadyExists);
+    }
+
     let generated = keypair::generate_keypair();
     let secret_key_encrypted = wallet_crypto::encrypt(encryption_key, &generated.secret_seed)
         .map_err(CreateWalletError::Encryption)?;

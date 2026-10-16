@@ -5,6 +5,7 @@ use crate::auth::extractor::AuthUser;
 use crate::error::{bad_request, internal, ApiResult, ErrorCode};
 use crate::models::{CreateWalletRequest, Wallet};
 use crate::services::wallets;
+use crate::services::wallets::CreateWalletError;
 use crate::AppState;
 
 pub async fn create(
@@ -18,7 +19,12 @@ pub async fn create(
     let network = req.network.unwrap_or_else(|| "stellar".into());
     let wallet = wallets::create_wallet(&state.db, merchant_id, &network, &state.wallet_encryption_key)
         .await
-        .map_err(internal)?;
+        .map_err(|e| match e {
+            CreateWalletError::AlreadyExists => {
+                bad_request(ErrorCode::WalletAlreadyExists, "merchant already has a wallet")
+            }
+            CreateWalletError::Db(err) => internal(err),
+        })?;
     Ok(Json(wallet))
 }
 
