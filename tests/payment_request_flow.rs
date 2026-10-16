@@ -216,6 +216,92 @@ async fn payment_request_list_xlm_sep7_uri_is_non_null() {
 }
 
 #[tokio::test]
+async fn deposit_held_pending_until_stellar_confirmation_threshold() {
+    let Some(state) = state().await else {
+        return;
+    };
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "pr_confirm_depth").await;
+    create_wallet(&app, &token).await;
+
+    let (status, created) = send(
+        app.clone(),
+        "POST",
+        "/payment-requests",
+        Some(&token),
+        Some(json!({ "amount_stroops": 30_000_000 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create failed: {created}");
+    let id: uuid::Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let memo = created["memo"].as_str().unwrap();
+
+    let wallet_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT wallet_id FROM payment_requests WHERE id = $1")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+
+    // Simulate a detected deposit at the current ledger with a confirmation
+    // threshold of 3 ledger closes.
+    let detected_ledger: i64 = 1_000;
+    let min_confirmations: i64 = 3;
+
+    let fake_payment_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO payments (id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset, network, status, ledger_sequence)
+         VALUES ($1, $2, $3, 'PLACEHOLDER', $4, 30000000, 'XLM', 'stellar', 'pending', $5)",
+    )
+    .bind(fake_payment_id)
+    .bind(merchant_id.parse::<uuid::Uuid>().unwrap())
+    .bind(wallet_id)
+    .bind(format!("test_tx_confirm_{memo}"))
+    .bind(detected_ledger)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // Before the threshold is reached, the deposit must remain pending and the
+    // merchant's available balance must not include it.
+    let promoted = aframp::blockchain::worker::promote_confirmed_deposits(
+        &state.db,
+        detected_ledger + min_confirmations - 1,
+        min_confirmations,
+    )
+    .await
+    .unwrap();
+    assert_eq!(promoted, 0, "deposit must not be promoted before the threshold");
+
+    let status_after_early: String =
+        sqlx::query_scalar("SELECT status FROM payments WHERE id = $1")
+            .bind(fake_payment_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(status_after_early, "pending", "deposit should still be pending");
+
+    // Advance the ledger past the threshold — now it should be promoted.
+    let promoted = aframp::blockchain::worker::promote_confirmed_deposits(
+        &state.db,
+        detected_ledger + min_confirmations,
+        min_confirmations,
+    )
+    .await
+    .unwrap();
+    assert_eq!(promoted, 1, "deposit should be promoted once the threshold is met");
+
+    let status_after: String =
+        sqlx::query_scalar("SELECT status FROM payments WHERE id = $1")
+            .bind(fake_payment_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(status_after, "confirmed", "deposit should be confirmed after threshold");
+}
+
+#[tokio::test]
+async fn payment_request_marked_paid_on_memo_correlated_deposit() {
 async fn payment_request_list_sep7_uri_matches_get_by_id() {
     let Some(state) = state().await else {
         return;

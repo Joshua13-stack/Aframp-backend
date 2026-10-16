@@ -83,6 +83,46 @@ async fn balance_and_transactions_start_empty() {
 }
 
 #[tokio::test]
+async fn create_wallet_twice_is_rejected() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let (token, _) = ensure_merchant(&app, "dup_wallet").await;
+
+    let (status, json) = send(
+        app.clone(),
+        "POST",
+        "/wallet/create",
+        Some(&token),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first create wallet failed: {json}");
+    let address = json["address"].as_str().unwrap().to_string();
+    assert!(!address.is_empty());
+
+    let (status, json) = send(
+        app.clone(),
+        "POST",
+        "/wallet/create",
+        Some(&token),
+        Some(json!({})),
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "expected 4xx for duplicate wallet creation, got {status}: {json}"
+    );
+
+    let (status, json) = send(app.clone(), "GET", "/wallet", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK, "get wallet failed: {json}");
+    assert_eq!(
+        json["address"], address,
+        "wallet address changed after rejected duplicate create"
+    );
+}
+
+#[tokio::test]
 async fn wallet_address_is_stable_per_merchant() {
     let app = app().await;
     let (token_a, _) = ensure_merchant(&app, "stable_a").await;

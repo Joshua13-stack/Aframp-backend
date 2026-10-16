@@ -10,6 +10,7 @@ pub enum CreateWalletError {
     Keygen(#[from] keypair::KeypairError),
     #[error("failed to encrypt wallet secret: {0}")]
     Encryption(String),
+    #[error("merchant already has a wallet")]
     #[error("merchant already has a wallet for network '{0}'")]
     DuplicateNetwork(String),
     /// The merchant already has a wallet — the `wallets_merchant_id_unique`
@@ -66,6 +67,14 @@ pub async fn create_wallet(
     network: &str,
     encryption_key: &[u8; 32],
 ) -> Result<Wallet, CreateWalletError> {
+    let existing = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM wallets WHERE merchant_id = $1 LIMIT 1",
+    )
+    .bind(merchant_id)
+    .fetch_optional(db)
+    .await?;
+    if existing.is_some() {
+        return Err(CreateWalletError::AlreadyExists);
     if wallet_by_merchant(db, merchant_id, network).await?.is_some() {
         return Err(CreateWalletError::DuplicateNetwork(network.to_string()));
     }

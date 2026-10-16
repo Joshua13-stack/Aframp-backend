@@ -12,7 +12,18 @@ pub enum PaymentError {
     Database(#[from] sqlx::Error),
 }
 
-pub async fn record_deposit(db: &PgPool, payment: NewPayment) -> Result<Payment, PaymentError> {
+/// Records a deposit, returning the payment row together with a flag that is
+/// `true` when the row was freshly inserted and `false` when an existing row
+/// was returned by the `tx_hash` idempotency check.
+///
+/// Callers must gate any balance mutation on the returned flag: a `false`
+/// value means this deposit has already been observed (possibly by an earlier
+/// poll cycle that crashed before completing), so re-applying a balance delta
+/// would double-credit the merchant.
+pub async fn record_deposit(
+    db: &PgPool,
+    payment: NewPayment,
+) -> Result<(Payment, bool), PaymentError> {
     let existing = sqlx::query_as::<_, Payment>(
         "SELECT id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
                 network, status, confirmations, created_at, updated_at
@@ -24,10 +35,10 @@ pub async fn record_deposit(db: &PgPool, payment: NewPayment) -> Result<Payment,
     .await?;
 
     if let Some(p) = existing {
-        return Ok(p);
+        return Ok((p, false));
     }
 
-    sqlx::query_as::<_, Payment>(
+    let inserted = sqlx::query_as::<_, Payment>(
         "INSERT INTO payments (
              merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset, network, status
          )
@@ -45,7 +56,9 @@ pub async fn record_deposit(db: &PgPool, payment: NewPayment) -> Result<Payment,
     .bind(PaymentStatus::Detected)
     .fetch_one(db)
     .await
-    .map_err(PaymentError::Database)
+    .map_err(PaymentError::Database)?;
+
+    Ok((inserted, true))
 }
 
 pub async fn set_status(

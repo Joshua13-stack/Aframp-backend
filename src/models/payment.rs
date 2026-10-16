@@ -17,6 +17,7 @@ pub struct Payment {
     pub network: String,
     pub status: PaymentStatus,
     pub confirmations: i32,
+    pub ledger: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -68,6 +69,7 @@ pub struct NewPayment {
     pub amount_stroops: i64,
     pub asset: String,
     pub network: String,
+    pub ledger: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]

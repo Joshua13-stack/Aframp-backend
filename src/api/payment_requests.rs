@@ -440,6 +440,20 @@ fn row_to_view(row: &payment_requests::PaymentRequestWithWallet) -> PaymentReque
     }
 }
 
+/// Percent-encodes a value for safe interpolation into a URI query string.
+///
+/// Encodes everything outside the unreserved set (`A-Z a-z 0-9 - . _ ~`), so
+/// query delimiters like `&`, `=`, `#`, `?` and `+` cannot break out of the
+/// parameter they belong to.
+fn encode_query_value(value: &str) -> String {
+    const UNRESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    percent_encoding::utf8_percent_encode(value, UNRESERVED).to_string()
+}
+
 fn build_sep7_uri(address: &str, amount_stroops: i64, asset: &str, memo: &str) -> Option<String> {
     if asset != "XLM" && asset != "native" {
         return None;
@@ -451,6 +465,9 @@ fn build_sep7_uri(address: &str, amount_stroops: i64, asset: &str, memo: &str) -
     );
     Some(format!(
         "web+stellar:pay?destination={}&amount={}&memo={}&memo_type=MEMO_TEXT",
+        encode_query_value(address),
+        encode_query_value(&amount),
+        encode_query_value(memo),
         percent_encode(address),
         percent_encode(&amount),
         percent_encode(memo),
@@ -487,6 +504,43 @@ fn map_payment_request_error(
 mod tests {
     use super::*;
 
+    #[test]
+    fn sep7_uri_encodes_memo_special_characters() {
+        let memo = "a&b=c#d";
+        let uri = build_sep7_uri("GABCDEF", 10_000_000, "XLM", memo).expect("XLM yields a URI");
+
+        // Raw delimiters must not survive into the query string.
+        assert!(!uri.contains("&b"), "raw `&` leaked into URI: {uri}");
+        assert!(!uri.contains("=c"), "raw `=` leaked into URI: {uri}");
+        assert!(!uri.contains("#d"), "raw `#` leaked into URI: {uri}");
+
+        // They must appear percent-encoded instead.
+        assert!(uri.contains("memo=a%26b%3Dc%23d"), "unexpected URI: {uri}");
+
+        // The URI still parses to the expected parameters.
+        let query = uri
+            .strip_prefix("web+stellar:pay?")
+            .expect("expected SEP-7 prefix");
+        let params: std::collections::HashMap<_, _> = query
+            .split('&')
+            .map(|pair| pair.split_once('=').expect("key=value pair"))
+            .collect();
+        assert_eq!(params.get("destination"), Some(&"GABCDEF"));
+        assert_eq!(params.get("amount"), Some(&"1.0000000"));
+        assert_eq!(params.get("memo"), Some(&"a%26b%3Dc%23d"));
+        assert_eq!(params.get("memo_type"), Some(&"MEMO_TEXT"));
+    }
+
+    #[test]
+    fn sep7_uri_encodes_address_and_amount() {
+        let uri = build_sep7_uri("G&addr", 12_345_678, "XLM", "deadbeef").expect("XLM yields a URI");
+        assert!(uri.contains("destination=G%26addr"), "unexpected URI: {uri}");
+        assert!(uri.contains("amount=1.2345678"), "unexpected URI: {uri}");
+    }
+
+    #[test]
+    fn sep7_uri_none_for_non_native_asset() {
+        assert!(build_sep7_uri("GABCDEF", 1, "cNGN", "deadbeef").is_none());
     fn query_params(uri: &str) -> Vec<(String, String)> {
         let query = uri.split_once('?').unwrap().1;
         query

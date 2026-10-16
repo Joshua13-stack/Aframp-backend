@@ -16,6 +16,10 @@ pub struct DetectedDeposit {
     pub amount_stroops: i64,
     pub asset: String,
     pub confirmations: i32,
+    /// Ledger sequence number in which the parent transaction was included.
+    /// The worker uses this to gate the pending → available promotion until
+    /// `STELLAR_MIN_CONFIRMATIONS` further ledgers have closed.
+    pub ledger: u32,
     /// The parent transaction's memo, if any — used to correlate a deposit to
     /// a specific payment request rather than just "something arrived."
     pub memo: Option<String>,
@@ -160,6 +164,11 @@ struct OperationRecord {
     op_type: String,
     transaction_successful: bool,
     transaction_hash: String,
+    /// Ledger sequence the operation was included in.  Horizon returns this
+    /// directly on the operation record; it may also appear on the joined
+    /// transaction, so both are consulted.
+    #[serde(default)]
+    ledger: Option<u32>,
     #[serde(default)]
     to: Option<String>,
     /// `path_payment_strict_send` uses `destination` instead of `to`.
@@ -200,6 +209,10 @@ struct ClaimantInfo {
 struct EmbeddedTransaction {
     #[serde(default)]
     memo: Option<String>,
+    /// Ledger sequence of the parent transaction, when Horizon includes it on
+    /// the joined transaction rather than the operation record itself.
+    #[serde(default)]
+    ledger: Option<u32>,
 }
 
 /// Distinguishes a funded account (200 OK) from an unfunded one (404) so the
@@ -315,6 +328,13 @@ fn record_to_deposit(record: OperationRecord, address: &str) -> Option<DetectedD
     };
 
     let memo = record.transaction.as_ref().and_then(|t| t.memo.clone());
+    // Prefer the ledger on the operation record; fall back to the joined
+    // transaction.  Default to 0 when Horizon omits it entirely so the worker
+    // can still track the deposit (it will simply wait for the threshold).
+    let ledger = record
+        .ledger
+        .or_else(|| record.transaction.as_ref().and_then(|t| t.ledger))
+        .unwrap_or(0);
 
     Some(DetectedDeposit {
         tx_hash: record.transaction_hash,
@@ -322,6 +342,7 @@ fn record_to_deposit(record: OperationRecord, address: &str) -> Option<DetectedD
         amount_stroops,
         asset,
         confirmations: 1,
+        ledger,
         memo,
     })
 }
@@ -394,6 +415,7 @@ mod tests {
             op_type: op_type.to_string(),
             transaction_successful: true,
             transaction_hash: "abc123".to_string(),
+            ledger: Some(1234),
             to: None,
             destination: None,
             account: None,
@@ -560,6 +582,50 @@ mod tests {
 
         listener.clear_backoff(addr_a);
         assert!(!listener.should_skip(addr_a));
+    }
+
+    // --------------------------------------------------------------------------
+    // #1197 — ledger sequence carried on detected deposits
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn deposit_carries_ledger_from_operation_record() {
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("payment");
+        rec.to = Some(addr.to_string());
+        rec.amount = Some("10.0000000".to_string());
+        rec.ledger = Some(4242);
+
+        let deposit = record_to_deposit(rec, addr).expect("payment should be detected");
+        assert_eq!(deposit.ledger, 4242);
+    }
+
+    #[test]
+    fn deposit_falls_back_to_transaction_ledger() {
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("payment");
+        rec.to = Some(addr.to_string());
+        rec.amount = Some("10.0000000".to_string());
+        rec.ledger = None;
+        rec.transaction = Some(EmbeddedTransaction {
+            memo: None,
+            ledger: Some(777),
+        });
+
+        let deposit = record_to_deposit(rec, addr).expect("payment should be detected");
+        assert_eq!(deposit.ledger, 777);
+    }
+
+    #[test]
+    fn deposit_defaults_ledger_to_zero_when_absent() {
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("payment");
+        rec.to = Some(addr.to_string());
+        rec.amount = Some("10.0000000".to_string());
+        rec.ledger = None;
+
+        let deposit = record_to_deposit(rec, addr).expect("payment should be detected");
+        assert_eq!(deposit.ledger, 0);
     }
 
     #[test]
