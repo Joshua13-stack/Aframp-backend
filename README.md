@@ -98,6 +98,9 @@ Fill in `.env`:
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DATABASE_URL` | yes | — | Postgres connection string |
+| `DB_MAX_CONNECTIONS` | no | `5` | Maximum size of the Postgres connection pool. Raise for production load; lower it on small managed Postgres tiers where the connection limit is shared across apps (e.g. Supabase free tier allows 15 total) |
+| `DB_MIN_CONNECTIONS` | no | `0` | Minimum number of idle connections kept open in the pool. Leave at `0` unless you want to avoid reconnect latency under steady load |
+| `DB_ACQUIRE_TIMEOUT_SECS` | no | `30` | How long a request waits for a free pooled connection before failing. Raise it if the pool is legitimately saturated; lower it to fail fast instead of queueing |
 | `APP_BIND_ADDR` | no | `127.0.0.1:3000` | Address the HTTP server binds to |
 | `JWT_SECRET` | yes | — | Secret used to sign merchant session tokens. Generate with `openssl rand -hex 32` |
 | `WEBHOOK_SECRET` | yes | — | Secret used to verify inbound provider webhooks. Generate with `openssl rand -hex 32` |
@@ -198,6 +201,7 @@ Authenticated routes accept either the `aframp_session` HttpOnly cookie (set by 
 | `POST` | `/payment-requests` | ✅ | Create a payment request for the authenticated merchant's wallet. Body: `{ amount_stroops, asset? (default XLM), expires_in_secs? (60–86400, default 900) }` |
 | `GET` | `/payment-requests?limit=` | ✅ | List the merchant's own requests, newest first (default 50, max 200) |
 | `GET` | `/payment-requests/{id}` | — | Deliberately public — a customer's wallet needs to read amount/destination/status before paying. Includes `sep7_uri` for XLM requests (`null` for cNGN — no issuer address configured yet) |
+| `GET` | `/payment-requests/{id}/status` | — | Deliberately public, lightweight polling endpoint returning only `{ id, status, paid_at }` — use this instead of the full request object for high-frequency status polling |
 | `POST` | `/withdraw` | ✅ | Debit available balance, record a withdrawal, and call Paystack Transfers. Body: `{ amount_stroops, asset? (cNGN only), bank_code, account_number }`. **Note:** the Paystack call is real, but nothing actually pays out yet — Paystack's own account balance is unfunded (Stage A gap) — see [Status](#status-real-progress-not-aspiration) |
 | `GET` | `/withdrawals?limit=` | ✅ | List the merchant's withdrawals, including `failure_reason` on failed ones |
 | `GET` | `/health` | — | Liveness check (`204 No Content`) |

@@ -10,6 +10,20 @@ use serde_json::json;
 
 use common::{ensure_merchant, send, state};
 
+/// Seeds a cNGN balance row directly into the DB for the given merchant.
+async fn seed_balance(state: &aframp::AppState, merchant_id: &str, available: i64) {
+    sqlx::query(
+        "INSERT INTO balances (merchant_id, asset, available, pending)
+         VALUES ($1::uuid, 'cNGN', $2, 0)
+         ON CONFLICT (merchant_id, asset) DO UPDATE SET available = $2, pending = 0",
+    )
+    .bind(merchant_id)
+    .bind(available)
+    .execute(&state.db)
+    .await
+    .unwrap();
+}
+
 struct FailingProvider;
 
 #[async_trait]
@@ -50,6 +64,66 @@ impl PaymentProvider for TimeoutProvider {
     async fn create_payout(&self, _req: &PayoutRequest) -> Result<PayoutResult, String> {
         Err("request to Paystack timed out".into())
     }
+}
+
+#[tokio::test]
+async fn withdrawal_happy_path_debits_balance_and_records_provider_reference() {
+    let Some(mut state) = state().await else {
+        return;
+    };
+    // MockProvider always succeeds, so this exercises the full happy path.
+    state.payment_provider = Arc::new(MockProvider);
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "happy_path").await;
+
+    seed_balance(&state, &merchant_id, 5_000_000).await;
+
+    // The seeded balance must actually be visible before we withdraw.
+    let balance = sqlx::query_scalar::<_, i64>(
+        "SELECT available FROM balances WHERE merchant_id = $1::uuid AND asset = 'cNGN'",
+    )
+    .bind(&merchant_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(balance, 5_000_000, "seeded balance should be non-zero");
+
+    let (status, json) = send(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(json!({
+            "amount_stroops": 2_000_000,
+            "asset": "cNGN",
+            "bank_code": "058",
+            "account_number": "0123456789"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "withdraw failed: {json}");
+
+    // Balance should be debited by exactly the withdrawal amount.
+    let balance = sqlx::query_scalar::<_, i64>(
+        "SELECT available FROM balances WHERE merchant_id = $1::uuid AND asset = 'cNGN'",
+    )
+    .bind(&merchant_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(balance, 3_000_000, "available balance should be debited by the withdrawal amount");
+
+    // The persisted row should carry the provider's status and reference.
+    let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let withdrawals = json.as_array().unwrap();
+    assert_eq!(withdrawals.len(), 1);
+    assert_eq!(withdrawals[0]["status"], "pending");
+    assert!(
+        withdrawals[0]["provider_reference"].as_str().is_some_and(|r| !r.is_empty()),
+        "provider_reference should be populated: {}",
+        withdrawals[0]
+    );
 }
 
 #[tokio::test]
@@ -276,14 +350,7 @@ async fn withdrawal_payout_failure_refunds_balance_and_records_reason() {
     let app = aframp::router(state.clone());
     let (token, merchant_id) = ensure_merchant(&app, "payout_fail").await;
 
-    sqlx::query(
-        "INSERT INTO balances (merchant_id, asset, available, pending)
-         VALUES ($1::uuid, 'cNGN', 5_000_000, 0)",
-    )
-    .bind(&merchant_id)
-    .execute(&state.db)
-    .await
-    .unwrap();
+    seed_balance(&state, &merchant_id, 5_000_000).await;
 
     let (status, json) = send(
         app.clone(),

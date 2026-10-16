@@ -54,6 +54,14 @@ pub enum OtpProviderKind {
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub database_url: String,
+    /// Maximum number of connections in the Postgres pool. Defaults to 5,
+    /// which suits local dev but may need raising for production load or
+    /// lowering for small managed tiers with shared connection limits.
+    pub db_max_connections: u32,
+    /// Minimum number of idle connections kept open in the pool.
+    pub db_min_connections: u32,
+    /// How long to wait for a pooled connection before giving up.
+    pub db_acquire_timeout_secs: u64,
     pub bind_addr: String,
     pub jwt_secret: SecretString,
     pub webhook_secret: SecretString,
@@ -118,6 +126,18 @@ impl AppConfig {
 
         Ok(Self {
             database_url: env("DATABASE_URL")?,
+            db_max_connections: std::env::var("DB_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(5),
+            db_min_connections: std::env::var("DB_MIN_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            db_acquire_timeout_secs: std::env::var("DB_ACQUIRE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
             bind_addr: std::env::var("APP_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into()),
             jwt_secret: SecretString::new(env("JWT_SECRET")?),
             webhook_secret: SecretString::new(env("WEBHOOK_SECRET")?),
@@ -189,6 +209,9 @@ mod tests {
             "{:?}",
             AppConfig {
                 database_url: "postgres://localhost".to_string(),
+                db_max_connections: 5,
+                db_min_connections: 0,
+                db_acquire_timeout_secs: 30,
                 bind_addr: "127.0.0.1:3000".to_string(),
                 jwt_secret: SecretString::new("jwt-secret-value".to_string()),
                 webhook_secret: SecretString::new("webhook-secret-value".to_string()),

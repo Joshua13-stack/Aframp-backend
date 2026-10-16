@@ -284,6 +284,24 @@ Query: `?limit=` (default 50, clamped 1–200).
 
 `expired` is computed at read time, so it's accurate the moment you fetch it. A request that expires and is *then* paid still flips to `paid` — expiry doesn't block correlation.
 
+### `GET /payment-requests/{id}/status`
+**No auth** — public like the parent endpoint. A lightweight, status-only view of a payment request, for high-frequency polling. It returns none of the heavy fields (`amount_stroops`, `address`, `sep7_uri`, …), just enough to drive a "waiting for payment" screen.
+
+`200` →
+```json
+{ "id": "26b6e670-a8b1-471d-ab0f-773a9a318a6a", "status": "pending", "paid_at": null }
+```
+
+| Field | Notes |
+|---|---|
+| `id` | The payment request id |
+| `status` | One of `pending`, `paid`, `partial`, `expired` |
+| `paid_at` | RFC 3339 timestamp when the request was paid, or `null` while unpaid |
+
+`expired` uses the **same read-time expiry logic as `GET /payment-requests/{id}`** (`effective_status()`), so the two endpoints never disagree about whether a request has expired. `404` (`PAYMENT_REQUEST_NOT_FOUND`) if the id doesn't exist.
+
+Poll this instead of the full object when you only need the status — it's the same detection latency (deposit detection runs on the `STELLAR_POLL_INTERVAL_SECS` timer, default 60s), just a smaller payload.
+
 ---
 
 ### `GET /balance`
@@ -386,22 +404,24 @@ The core merchant loop:
 
 1. `POST /payment-requests` with the amount → get `id` and `sep7_uri`
 2. Render `sep7_uri` as a QR code; show the amount and a countdown to `expires_at`
-3. Poll `GET /payment-requests/{id}` every 3–5s
+3. Poll `GET /payment-requests/{id}/status` every 3–5s
 4. On `status: "paid"` → show "Payment received"; on `"expired"` → offer to regenerate
 
 ```js
 async function waitForPayment(id, { signal } = {}) {
   while (!signal?.aborted) {
-    const res = await fetch(`${API}/payment-requests/${id}`, { signal });
+    const res = await fetch(`${API}/payment-requests/${id}/status`, { signal });
     if (!res.ok) throw new Error(`lookup failed: ${res.status}`);
-    const pr = await res.json();
-    if (pr.status !== 'pending') return pr;      // 'paid' or 'expired'
+    const { status } = await res.json();
+    if (status !== 'pending') return status;     // 'paid' or 'expired'
     await new Promise((r) => setTimeout(r, 4000));
   }
 }
 ```
 
 Note step 3 needs no auth token, so a customer-facing payment page can use it directly.
+
+**Prefer the status endpoint for polling.** `GET /payment-requests/{id}/status` returns only `{ id, status, paid_at }` — the same status and the same read-time expiry logic as the full object, without the `amount_stroops`/`address`/`sep7_uri` payload. Fetch the full `GET /payment-requests/{id}` once, up front, to render the QR and amount; poll the status endpoint after that.
 
 ---
 
