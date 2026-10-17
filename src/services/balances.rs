@@ -19,6 +19,13 @@ pub async fn get_balances(
 }
 
 #[tracing::instrument(skip_all, err, fields(merchant_id = %delta.merchant_id, asset = %delta.asset))]
+/// Unconditionally adds `delta` to a balance row, creating it if needed.
+///
+/// Only for credits and for moving funds `pending -> available` (the deposit
+/// worker is the sole caller). Debits of `available` must go through the
+/// guarded `available >= amount` update in `services::withdrawals`; the
+/// `check_available_non_negative` constraint (migration 0021) rejects any write that would
+/// take `available` below zero.
 pub async fn apply_delta(db: &PgPool, delta: &UpdateBalance) -> Result<(), sqlx::Error> {
     // Not a single INSERT .. ON CONFLICT DO UPDATE: Postgres checks the
     // proposed INSERT row against the non-negative CHECK constraints before

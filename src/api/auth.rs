@@ -1,13 +1,16 @@
-use axum::extract::State;
-use axum::http::{header, StatusCode};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, State};
+use axum::http::{header, Extensions, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use crate::auth::extractor::Session;
 use crate::auth::jwt;
 use crate::auth::password;
-use crate::error::{bad_request, bad_request_field, internal, unauthorized, ApiResult, ErrorCode};
+use crate::error::{bad_request_field, internal, unauthorized, ApiError, ApiResult, ErrorCode};
 use crate::models::{AuthResponse, LoginRequest, OtpChallengeResponse, SignupRequest, VerifyOtpRequest};
+use crate::services::login_rate_limit;
 use crate::services::otp::{self, VerifiedOutcome};
 use crate::services::users;
 use crate::validation::{is_valid_email, normalize_ng_phone_number, validate_name, validate_password, MAX_PASSWORD_LEN};
@@ -55,10 +58,25 @@ pub async fn signup(
 /// OTP challenge instead of a session. An account with no phone on file
 /// (only possible pre-migration — every signup requires one now) logs in
 /// exactly as it always has, untouched by this rollout.
+///
+/// Attempts are rate limited per client IP (see `services::login_rate_limit`);
+/// over the limit returns `429` with `Retry-After`. Per-account brute force
+/// is handled by the failed-login lockout in `services::users::login`.
 pub async fn login(
     State(state): State<AppState>,
+    extensions: Extensions,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Response> {
+    if let Some(ConnectInfo(addr)) = extensions.get::<ConnectInfo<SocketAddr>>() {
+        let key = login_rate_limit::ip_key(addr.ip());
+        if let Some(retry_after) = login_rate_limit::hit(&state.db, &key, login_rate_limit::IP_LIMIT)
+            .await
+            .map_err(internal)?
+        {
+            return Ok(login_rate_limited(retry_after));
+        }
+    }
+
     if !is_valid_email(&req.email) {
         return Err(bad_request_field("email", "must be a valid email address"));
     }
@@ -130,7 +148,16 @@ pub async fn verify_otp(
 
 /// Drops the session cookie. Deliberately unauthenticated: a browser holding an
 /// expired or malformed session still needs a way to clear it.
-pub async fn logout(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<impl IntoResponse> {
+    // Revoke the presented token too, so a copy held elsewhere stops working.
+    if let Some(token) = crate::auth::extractor::session_token(&headers) {
+        if let Ok(claims) = jwt::verify(&state.jwt_secret, token) {
+            jwt::revoke(&state.db, &claims).await.map_err(internal)?;
+        }
+    }
     let cookie = state.cookie.clear().map_err(internal)?;
     Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
 }
@@ -157,4 +184,18 @@ pub async fn refresh(State(state): State<AppState>, Session(claims): Session) ->
 fn authenticated(state: &AppState, body: AuthResponse) -> ApiResult<impl IntoResponse> {
     let cookie = state.cookie.session(&body.token).map_err(internal)?;
     Ok(([(header::SET_COOKIE, cookie)], Json(body)))
+}
+
+fn login_rate_limited(retry_after_secs: i64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, retry_after_secs.to_string())],
+        Json(ApiError {
+            error: "too many login attempts, please try again later".into(),
+            code: ErrorCode::TooManyRequests,
+            field: None,
+            retry_after_secs: Some(retry_after_secs.max(0) as u64),
+        }),
+    )
+        .into_response()
 }

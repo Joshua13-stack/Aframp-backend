@@ -318,3 +318,73 @@ pub async fn unsubscribe_deposit_email(
     .await?;
     Ok(result.rows_affected() > 0)
 }
+
+/// Adds one confirmation to every deposit still waiting in `verified`. Called
+/// once per poll pass, so `confirmations` counts passes since detection.
+pub async fn age_verified_deposits(db: &PgPool) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE payments SET confirmations = confirmations + 1, updated_at = now()
+          WHERE status = 'verified'",
+    )
+    .execute(db)
+    .await?
+    .rows_affected())
+}
+
+/// Records the first confirmation of a newly verified deposit.
+pub async fn bump_confirmations(db: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE payments SET confirmations = confirmations + 1, updated_at = now()
+          WHERE id = $1 AND status = 'verified'",
+    )
+    .bind(id)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+/// Promotes every verified deposit with at least `min_confirmations` to
+/// `confirmed`, moving its amount from `pending` to `available` in the same
+/// transaction. Returns how many were promoted.
+pub async fn promote_confirmed(db: &PgPool, min_confirmations: i32) -> Result<u64, sqlx::Error> {
+    let ready = sqlx::query_as::<_, Payment>(
+        "SELECT id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
+                network, status, confirmations, created_at, updated_at
+           FROM payments
+          WHERE status = 'verified' AND confirmations >= $1",
+    )
+    .bind(min_confirmations)
+    .fetch_all(db)
+    .await?;
+
+    let mut promoted = 0;
+    for p in ready {
+        let mut tx = db.begin().await?;
+        // Guarded on status so a concurrent pass can't promote it twice.
+        let updated = sqlx::query(
+            "UPDATE payments SET status = 'confirmed', updated_at = now()
+              WHERE id = $1 AND status = 'verified'",
+        )
+        .bind(p.id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            tx.rollback().await?;
+            continue;
+        }
+        sqlx::query(
+            "UPDATE balances
+                SET available = available + $3, pending = pending - $3, updated_at = now()
+              WHERE merchant_id = $1 AND asset = $2",
+        )
+        .bind(p.merchant_id)
+        .bind(&p.asset)
+        .bind(p.amount_stroops)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        promoted += 1;
+    }
+    Ok(promoted)
+}

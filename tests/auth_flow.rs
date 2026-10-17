@@ -976,3 +976,111 @@ async fn oversized_password_is_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
     assert_eq!(json["field"], "password");
 }
+
+/// Sends a `/login` request, optionally as if it came from `peer` (the
+/// connection info the server attaches in production), and returns the
+/// status, body and `Retry-After` header.
+async fn login_from(
+    app: &axum::Router,
+    email: &str,
+    password: &str,
+    peer: Option<std::net::SocketAddr>,
+) -> (StatusCode, serde_json::Value, Option<String>) {
+    use tower::ServiceExt;
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/login")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&json!({ "email": email, "password": password })).unwrap(),
+        ))
+        .unwrap();
+    if let Some(peer) = peer {
+        request.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+    }
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap_or_default(), retry_after)
+}
+
+#[tokio::test]
+async fn login_rate_limited_per_ip_across_emails() {
+    let app = app().await;
+    // A random loopback address keeps this test's IP counter to itself.
+    let octets = Uuid::new_v4().as_bytes()[..3].to_vec();
+    let peer: std::net::SocketAddr = (
+        std::net::Ipv4Addr::new(127, octets[0], octets[1], octets[2]),
+        40_000,
+    )
+        .into();
+
+    for _ in 0..aframp::services::login_rate_limit::IP_LIMIT {
+        let email = format!("iplimit+{}@example.com", Uuid::new_v4().simple());
+        let (status, body, _) = login_from(&app, &email, "wrong-password", Some(peer)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    }
+
+    let email = format!("iplimit+{}@example.com", Uuid::new_v4().simple());
+    let (status, _, retry_after) = login_from(&app, &email, "wrong-password", Some(peer)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(retry_after.is_some());
+}
+
+/// Creates a legacy (no-phone) account, which `/login` answers with a session
+/// directly, and returns its email.
+async fn legacy_account(db: &sqlx::PgPool, seed: &str) -> String {
+    let email = format!("{seed}+{}@example.com", Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO users (email, password_hash, name) VALUES ($1, $2, 'Legacy User')")
+        .bind(&email)
+        .bind(aframp_password_hash_for_tests())
+        .execute(db)
+        .await
+        .unwrap();
+    email
+}
+
+async fn legacy_login(app: &axum::Router, email: &str) -> String {
+    let (status, body, _) = login_from(app, email, "legacy-password-123", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["token"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn logout_revokes_the_token_for_reuse() {
+    let (app, db) = app_and_db().await;
+    let email = legacy_account(&db, "revoke").await;
+    let token = legacy_login(&app, &email).await;
+
+    let (status, _) = send(app.clone(), "GET", "/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(app.clone(), "POST", "/logout", Some(&token), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // A copy of the token held elsewhere no longer works.
+    let (status, body) = send(app.clone(), "GET", "/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+}
+
+#[tokio::test]
+async fn logout_revokes_only_the_presented_session() {
+    let (app, db) = app_and_db().await;
+    let email = legacy_account(&db, "revoke_one").await;
+    let first = legacy_login(&app, &email).await;
+    let second = legacy_login(&app, &email).await;
+    assert_ne!(first, second, "each login must carry its own jti");
+
+    let (status, _) = send(app.clone(), "POST", "/logout", Some(&first), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = send(app.clone(), "GET", "/me", Some(&first), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(app.clone(), "GET", "/me", Some(&second), None).await;
+    assert_eq!(status, StatusCode::OK, "the other session stays valid");
+}

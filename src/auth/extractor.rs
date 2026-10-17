@@ -90,14 +90,38 @@ async fn authenticate_api_key(
     }))
 }
 
-fn authenticate(parts: &Parts, state: &AppState) -> Result<Claims, (StatusCode, Json<ApiError>)> {
-    // API clients send a bearer token; browsers send the HttpOnly session
-    // cookie, which JS on the page cannot read. Either proves the session.
-    let token = bearer_token(parts)
-        .or_else(|| cookie::from_headers(&parts.headers))
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(ApiError { code: ErrorCode::InvalidCredentials, error: "missing session cookie or bearer token".into(), field: None, retry_after_secs: None })))?;
-    jwt::verify(&state.jwt_secret, token)
-        .map_err(|_| (StatusCode::UNAUTHORIZED, Json(ApiError { code: ErrorCode::InvalidCredentials, error: "invalid or expired token".into(), field: None, retry_after_secs: None })))
+/// The session token from the `Authorization: Bearer` header, falling back to
+/// the session cookie. API clients send a bearer token; browsers send the
+/// HttpOnly session cookie, which JS on the page cannot read.
+pub(crate) fn session_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| cookie::from_headers(headers))
+}
+
+/// Verifies the session token and that it hasn't been revoked by a logout.
+async fn authenticate(parts: &Parts, state: &AppState) -> Result<Claims, (StatusCode, Json<ApiError>)> {
+    let unauthorized = |msg: &str| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiError {
+                code: ErrorCode::InvalidCredentials,
+                error: msg.into(),
+                field: None,
+                retry_after_secs: None,
+            }),
+        )
+    };
+    let token = session_token(&parts.headers)
+        .ok_or_else(|| unauthorized("missing session cookie or bearer token"))?;
+    jwt::verify_active(&state.db, &state.jwt_secret, token)
+        .await
+        .map_err(|err| match err {
+            jwt::VerifyError::Database(e) => internal(e),
+            _ => unauthorized("invalid or expired token"),
+        })
 }
 
 /// Verifies the token and that its account still exists and hasn't been
@@ -106,7 +130,7 @@ async fn authenticate_active(
     parts: &Parts,
     state: &AppState,
 ) -> Result<Claims, (StatusCode, Json<ApiError>)> {
-    let claims = authenticate(parts, state)?;
+    let claims = authenticate(parts, state).await?;
     if !users::is_active(&state.db, claims.sub).await.map_err(internal)? {
         return Err((
             StatusCode::UNAUTHORIZED,

@@ -14,6 +14,7 @@ pub async fn run(
     horizon_url: String,
     poll_interval_secs: u64,
     poll_concurrency: usize,
+    min_confirmations: i32,
 ) {
     let listener = StellarListener::new(horizon_url).with_concurrency(poll_concurrency);
 
@@ -24,7 +25,9 @@ pub async fn run(
             poll_concurrency,
             poll_cycle_duration_ms = tracing::field::Empty
         );
-        let result = poll_once(&state.db, &listener).instrument(span.clone()).await;
+        let result = poll_once_with_confirmations(&state.db, &listener, min_confirmations)
+            .instrument(span.clone())
+            .await;
         span.record("poll_cycle_duration_ms", started.elapsed().as_millis() as u64);
         if let Err(err) = result {
             tracing::warn!(error = %err, "deposit poll failed");
@@ -33,15 +36,32 @@ pub async fn run(
     }
 }
 
-/// Polls the blockchain listener once and processes any detected deposits.
+/// Polls the blockchain listener once and processes any detected deposits,
+/// crediting them after a single confirmation (see
+/// [`poll_once_with_confirmations`]).
 ///
 /// Generic over [`BlockchainListener`] so tests can inject a mock listener
 /// (e.g. to simulate a fake deposit) without hitting a real chain.
-#[tracing::instrument(skip_all, err)]
 pub async fn poll_once<L: BlockchainListener + ?Sized>(
     db: &PgPool,
     listener: &L,
 ) -> Result<(), String> {
+    poll_once_with_confirmations(db, listener, 1).await
+}
+
+/// One poll pass: record newly detected deposits (credited to `pending`),
+/// then promote deposits that have waited `min_confirmations` passes to
+/// `available` (`STELLAR_MIN_CONFIRMATIONS`).
+#[tracing::instrument(skip_all, err)]
+pub async fn poll_once_with_confirmations<L: BlockchainListener + ?Sized>(
+    db: &PgPool,
+    listener: &L,
+    min_confirmations: i32,
+) -> Result<(), String> {
+    // Deposits already waiting gain a confirmation for this pass; new ones
+    // recorded below start at one.
+    payments::age_verified_deposits(db).await.map_err(|e| e.to_string())?;
+
     let skip = listener.skipped_addresses();
     let wallet_list = wallets::pollable_wallets(db, &skip)
         .await
@@ -82,6 +102,21 @@ pub async fn poll_once<L: BlockchainListener + ?Sized>(
             tracing::warn!(error = %err, address = %result.address, "failed to persist poll cursor");
         }
     }
+    promote_confirmed_deposits(db, min_confirmations).await
+}
+
+/// Second pass: every verified deposit gains one confirmation per poll pass,
+/// and those with at least `min_confirmations` move from `pending` to
+/// `available` and become `confirmed`. Counting per pass (rather than per
+/// re-sighting) is what makes this work with cursor-based polling, which
+/// only ever fetches a given operation once.
+pub async fn promote_confirmed_deposits(db: &PgPool, min_confirmations: i32) -> Result<(), String> {
+    let promoted = payments::promote_confirmed(db, min_confirmations)
+        .await
+        .map_err(|e| e.to_string())?;
+    if promoted > 0 {
+        tracing::info!(promoted, min_confirmations, "deposits confirmed");
+    }
     Ok(())
 }
 
@@ -115,6 +150,9 @@ pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), Stri
     payments::set_status(db, payment.id, UpdatePaymentStatus::Verified)
         .await
         .map_err(|e| e.to_string())?;
+    payments::bump_confirmations(db, payment.id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     balances::apply_delta(
         db,
@@ -123,22 +161,6 @@ pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), Stri
             asset: d.asset.clone(),
             available_delta: 0,
             pending_delta: d.amount_stroops,
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    // TODO: move pending → available after Stellar confirmations threshold.
-    payments::set_status(db, payment.id, UpdatePaymentStatus::Confirmed)
-        .await
-        .map_err(|e| e.to_string())?;
-    balances::apply_delta(
-        db,
-        &UpdateBalance {
-            merchant_id: wallet.merchant_id,
-            asset: d.asset.clone(),
-            available_delta: d.amount_stroops,
-            pending_delta: -d.amount_stroops,
         },
     )
     .await
