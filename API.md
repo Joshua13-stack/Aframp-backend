@@ -232,6 +232,44 @@ Never use floating-point arithmetic to accumulate balances — convert for displ
 
 ---
 
+## Amounts and Denominations
+
+All monetary values in this API are integers denominated in **stroops** — the
+smallest unit of Stellar assets. Never send whole units.
+
+- `1 XLM = 10,000,000 stroops`
+- `1 cNGN = 10,000,000 stroops`
+- `1 cNGN stroop = 100,000 kobo` (i.e. `1 cNGN` = `100 kobo`)
+
+Conversion formula:
+
+```
+amount_stroops = whole_units × 10,000,000
+```
+
+| Whole units | `amount_stroops` |
+|---|---|
+| 0.0000001 XLM | 1 (minimum) |
+| 1 XLM / 1 cNGN | 10,000,000 |
+| 2.5 XLM | 25,000,000 |
+| 50 cNGN | 500,000,000 |
+| 2,500 cNGN (₦2,500) | 25,000,000,000 |
+
+Example: `₦2,500 = 25,000,000,000 cNGN stroops`.
+
+> **Warning:** the most common integration mistake is sending amounts in whole
+> units (e.g. `25`) instead of stroops (`250,000,000`). That creates a payment
+> for `0.0000025` units. Always multiply by `10,000,000` before sending, and
+> never use floating-point arithmetic to accumulate balances — convert for
+> display only.
+
+```js
+const toDisplay = (stroops) => (stroops / 10_000_000).toFixed(7);
+const toStroops = (amount) => Math.round(amount * 10_000_000);
+```
+
+---
+
 ## Pagination
 
 `GET /transactions`, `GET /payment-requests` and `GET /withdrawals` return
