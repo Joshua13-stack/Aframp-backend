@@ -98,7 +98,7 @@ pub async fn create(
     )
     .await?;
 
-    Ok(Json(to_view(&pr, &wallet.address, &wallet.network)))
+    Ok(Json(to_view(&pr, &wallet.address, &wallet.network, state.cngn_issuer.as_deref().map(String::as_str))))
 }
 
 pub async fn get(
@@ -120,7 +120,7 @@ pub async fn get(
         .map_err(internal)?
         .ok_or_else(|| internal("payment request references a missing wallet"))?;
 
-    Ok(Json(to_view(&pr, &wallet.address, &wallet.network)))
+    Ok(Json(to_view(&pr, &wallet.address, &wallet.network, state.cngn_issuer.as_deref().map(String::as_str))))
 }
 
 /// Renders the payment request's SEP-0007 URI as a PNG QR code so merchants
@@ -145,7 +145,13 @@ pub async fn qr(
         .map_err(internal)?
         .ok_or_else(|| internal("payment request references a missing wallet"))?;
 
-    let sep7_uri = build_sep7_uri(&wallet.address, pr.amount_stroops, &pr.asset, &pr.memo)
+    let sep7_uri = build_sep7_uri(
+        &wallet.address,
+        pr.amount_stroops,
+        &pr.asset,
+        &pr.memo,
+        state.cngn_issuer.as_deref().map(String::as_str),
+    )
         .ok_or_else(|| {
             bad_request(
                 ErrorCode::InvalidParameters,
@@ -259,7 +265,9 @@ pub async fn list(
     .map_err(internal)?;
 
     let page = Page::new(
-        rows.iter().map(row_to_view).collect(),
+        rows.iter()
+            .map(|row| row_to_view(row, state.cngn_issuer.as_deref().map(String::as_str)))
+            .collect(),
         limit,
         |v: &PaymentRequestView| Cursor {
             created_at: v.created_at,
@@ -295,7 +303,7 @@ pub async fn expire(
         .await
         .map_err(internal)?
         .ok_or_else(|| internal("payment request references a missing wallet"))?;
-    Ok(Json(to_view(&pr, &wallet.address, &wallet.network)))
+    Ok(Json(to_view(&pr, &wallet.address, &wallet.network, state.cngn_issuer.as_deref().map(String::as_str))))
 }
 
 /// Soft-delete (archive) a payment request owned by the authenticated merchant.
@@ -339,7 +347,7 @@ pub async fn cancel(
         .map_err(internal)?
         .ok_or_else(|| internal("payment request references a missing wallet"))?;
 
-    Ok(Json(to_view(&pr, &wallet.address, &wallet.network)))
+    Ok(Json(to_view(&pr, &wallet.address, &wallet.network, state.cngn_issuer.as_deref().map(String::as_str))))
 }
 
 #[derive(serde::Deserialize)]
@@ -351,7 +359,12 @@ pub struct ListParams {
     pub include_cancelled: Option<bool>,
 }
 
-fn to_view(pr: &PaymentRequest, address: &str, network: &str) -> PaymentRequestView {
+fn to_view(
+    pr: &PaymentRequest,
+    address: &str,
+    network: &str,
+    cngn_issuer: Option<&str>,
+) -> PaymentRequestView {
     PaymentRequestView {
         id: pr.id,
         merchant_id: pr.merchant_id,
@@ -364,11 +377,14 @@ fn to_view(pr: &PaymentRequest, address: &str, network: &str) -> PaymentRequestV
         expires_at: pr.expires_at,
         cancelled_at: pr.cancelled_at,
         created_at: pr.created_at,
-        sep7_uri: build_sep7_uri(address, pr.amount_stroops, &pr.asset, &pr.memo),
+        sep7_uri: build_sep7_uri(address, pr.amount_stroops, &pr.asset, &pr.memo, cngn_issuer),
     }
 }
 
-fn row_to_view(row: &payment_requests::PaymentRequestWithWallet) -> PaymentRequestView {
+fn row_to_view(
+    row: &payment_requests::PaymentRequestWithWallet,
+    cngn_issuer: Option<&str>,
+) -> PaymentRequestView {
     PaymentRequestView {
         id: row.id,
         merchant_id: row.merchant_id,
@@ -381,23 +397,39 @@ fn row_to_view(row: &payment_requests::PaymentRequestWithWallet) -> PaymentReque
         expires_at: row.expires_at,
         cancelled_at: row.cancelled_at,
         created_at: row.created_at,
-        sep7_uri: build_sep7_uri(&row.address, row.amount_stroops, &row.asset, &row.memo),
+        sep7_uri: build_sep7_uri(&row.address, row.amount_stroops, &row.asset, &row.memo, cngn_issuer),
     }
 }
 
-fn build_sep7_uri(address: &str, amount_stroops: i64, asset: &str, memo: &str) -> Option<String> {
-    if asset != "XLM" && asset != "native" {
-        return None;
-    }
+/// SEP-0007 `pay` URI. Native XLM needs no asset parameters; cNGN is a credit
+/// asset, so the URI must name its issuer, and without a configured issuer
+/// there is no URI (a guessed issuer would misdirect the payment). Any other
+/// asset gets none.
+fn build_sep7_uri(
+    address: &str,
+    amount_stroops: i64,
+    asset: &str,
+    memo: &str,
+    cngn_issuer: Option<&str>,
+) -> Option<String> {
+    let asset_params = match asset {
+        "XLM" | "native" => String::new(),
+        "cNGN" => format!(
+            "&asset_code=cNGN&asset_issuer={}",
+            percent_encode(cngn_issuer?)
+        ),
+        _ => return None,
+    };
     let amount = format!(
         "{}.{:07}",
         amount_stroops / 10_000_000,
         amount_stroops % 10_000_000
     );
     Some(format!(
-        "web+stellar:pay?destination={}&amount={}&memo={}&memo_type=MEMO_TEXT",
+        "web+stellar:pay?destination={}&amount={}{}&memo={}&memo_type=MEMO_TEXT",
         percent_encode(address),
         percent_encode(&amount),
+        asset_params,
         percent_encode(memo),
     ))
 }
@@ -450,7 +482,7 @@ mod tests {
 
     #[test]
     fn sep7_uri_encodes_special_characters_in_memo() {
-        let uri = build_sep7_uri("GABC", 10_000_000, "XLM", "a&b=c#d e").unwrap();
+        let uri = build_sep7_uri("GABC", 10_000_000, "XLM", "a&b=c#d e", None).unwrap();
         assert_eq!(
             uri,
             "web+stellar:pay?destination=GABC&amount=1.0000000&memo=a%26b%3Dc%23d%20e&memo_type=MEMO_TEXT"
@@ -460,7 +492,7 @@ mod tests {
 
     #[test]
     fn sep7_uri_cannot_gain_injected_params() {
-        let uri = build_sep7_uri("GABC", 1, "native", "x&destination=GEVIL").unwrap();
+        let uri = build_sep7_uri("GABC", 1, "native", "x&destination=GEVIL", None).unwrap();
         let params = query_params(&uri);
         let keys: Vec<&str> = params.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, ["destination", "amount", "memo", "memo_type"]);
@@ -470,7 +502,7 @@ mod tests {
     #[test]
     fn sep7_uri_round_trips_through_a_parser() {
         let memo = "pay #42 & tip = 5%";
-        let uri = build_sep7_uri("GDEST", 25_000_000, "XLM", memo).unwrap();
+        let uri = build_sep7_uri("GDEST", 25_000_000, "XLM", memo, None).unwrap();
         let params = query_params(&uri);
         assert_eq!(
             params,
@@ -485,6 +517,15 @@ mod tests {
 
     #[test]
     fn sep7_uri_is_none_for_non_native_assets() {
-        assert!(build_sep7_uri("GABC", 1, "cNGN", "m").is_none());
+        assert!(build_sep7_uri("GABC", 1, "cNGN", "m", None).is_none());
+        assert!(build_sep7_uri("GABC", 1, "USDC", "m", Some("GISSUER")).is_none());
+    }
+
+    #[test]
+    fn sep7_uri_for_cngn_names_the_configured_issuer() {
+        let uri = build_sep7_uri("GABC", 10_000_000, "cNGN", "m", Some("GISSUER")).unwrap();
+        let params = query_params(&uri);
+        assert!(params.contains(&("asset_code".to_string(), "cNGN".to_string())));
+        assert!(params.contains(&("asset_issuer".to_string(), "GISSUER".to_string())));
     }
 }

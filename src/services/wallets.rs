@@ -4,6 +4,20 @@ use uuid::Uuid;
 use crate::blockchain::{keypair, wallet_crypto};
 use crate::models::{NewWallet, Wallet, WalletSecretRow};
 
+/// Purpose recorded in `wallet_secret_access_log` for decryptions done by
+/// [`rotate_encryption_key`].
+pub const PURPOSE_KEY_ROTATION: &str = "key_rotation";
+
+#[derive(Debug, thiserror::Error)]
+pub enum WalletSecretError {
+    #[error("wallet not found")]
+    NotFound,
+    #[error("failed to decrypt wallet secret: {0}")]
+    Decryption(String),
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CreateWalletError {
     #[error("failed to generate wallet keypair: {0}")]
@@ -30,30 +44,6 @@ pub enum DecryptWalletError {
     Decryption(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
-}
-
-/// Fetches the encrypted secret seed for `wallet_id` from the database and
-/// decrypts it using `key`.
-///
-/// This is intentionally separate from the public `Wallet` model, which never
-/// exposes the encrypted secret — keeping the secret out of the read path
-/// until it is explicitly needed.
-///
-/// # Usage
-/// Currently only needed for the settlement/sweep feature (signing outbound
-/// Stellar transactions on behalf of a merchant).  The `AppState` carries the
-/// key; see the TODO comment there.
-pub async fn decrypt_wallet_secret(
-    db: &PgPool,
-    wallet_id: Uuid,
-    key: &[u8; 32],
-) -> Result<String, DecryptWalletError> {
-    let row = wallet_secret_by_id(db, wallet_id)
-        .await?
-        .ok_or(DecryptWalletError::NotFound)?;
-    let secret_key_encrypted = row.secret_key_encrypted;
-    wallet_crypto::decrypt(key, &secret_key_encrypted)
-        .map_err(DecryptWalletError::Decryption)
 }
 
 #[tracing::instrument(skip_all, err, fields(merchant_id = %merchant_id))]
@@ -236,4 +226,66 @@ pub async fn wallet_secret_by_id(
     .bind(id)
     .fetch_optional(db)
     .await
+}
+
+/// Decrypt a wallet's Stellar secret seed. Every call is recorded in
+/// `wallet_secret_access_log` with `purpose` (e.g. `"sweep"`) before the
+/// secret is decrypted, so each use of the encryption key leaves a trail.
+pub async fn decrypt_secret(
+    db: &PgPool,
+    wallet_id: Uuid,
+    encryption_key: &[u8; 32],
+    purpose: &str,
+) -> Result<String, WalletSecretError> {
+    let encrypted = wallet_secret_by_id(db, wallet_id)
+        .await?
+        .ok_or(WalletSecretError::NotFound)?
+        .secret_key_encrypted;
+
+    log_secret_access(db, wallet_id, purpose).await?;
+    tracing::info!(%wallet_id, purpose, "wallet secret decrypted");
+
+    wallet_crypto::decrypt(encryption_key, &encrypted).map_err(WalletSecretError::Decryption)
+}
+
+async fn log_secret_access<'e, E>(executor: E, wallet_id: Uuid, purpose: &str) -> Result<(), sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query("INSERT INTO wallet_secret_access_log (wallet_id, purpose) VALUES ($1, $2)")
+        .bind(wallet_id)
+        .bind(purpose)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// Re-encrypt every wallet secret from `old_key` to `new_key` in one
+/// transaction: if any secret fails to decrypt under `old_key`, nothing is
+/// changed. Each decryption is audit-logged as [`PURPOSE_KEY_ROTATION`].
+/// Returns the number of wallets re-encrypted.
+pub async fn rotate_encryption_key(
+    db: &PgPool,
+    old_key: &[u8; 32],
+    new_key: &[u8; 32],
+) -> Result<usize, WalletSecretError> {
+    let mut tx = db.begin().await?;
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, secret_key_encrypted FROM wallets ORDER BY id FOR UPDATE")
+            .fetch_all(&mut *tx)
+            .await?;
+
+    for (wallet_id, encrypted) in &rows {
+        log_secret_access(&mut *tx, *wallet_id, PURPOSE_KEY_ROTATION).await?;
+        let rotated = wallet_crypto::reencrypt(old_key, new_key, encrypted)
+            .map_err(|e| WalletSecretError::Decryption(format!("wallet {wallet_id}: {e}")))?;
+        sqlx::query("UPDATE wallets SET secret_key_encrypted = $1 WHERE id = $2")
+            .bind(&rotated)
+            .bind(wallet_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(rows.len())
 }

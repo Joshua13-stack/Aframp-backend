@@ -52,7 +52,7 @@ pub struct AppState {
     /// yet wired into any handler or the deposit worker — the worker only reads
     /// the public wallet address.
     ///
-    /// TODO: wire `decrypt_wallet_secret` into the settlement/sweep feature
+    /// TODO: wire `services::wallets::decrypt_secret` (audit-logged) into the settlement/sweep feature
     /// so the platform wallet can sign outbound transactions on behalf of a
     /// merchant.  See PRD §settlement-sweep.
     pub wallet_encryption_key: std::sync::Arc<zeroize::Zeroizing<[u8; 32]>>,
@@ -63,6 +63,9 @@ pub struct AppState {
     pub admin_events: broadcast::Sender<AdminEvent>,
     /// Optional per-merchant cap on withdrawals per UTC day, in stroops.
     pub daily_withdrawal_limit_stroops: Option<i64>,
+    /// cNGN issuer account (`CNGNX_ISSUER_ADDRESS`); cNGN payment requests
+    /// only get a SEP-0007 URI when it is configured.
+    pub cngn_issuer: Option<std::sync::Arc<String>>,
 }
 
 impl AppState {
@@ -94,6 +97,9 @@ pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::er
                 .termii_sender_id
                 .clone()
                 .expect("TERMII_SENDER_ID is required when OTP_PROVIDER=termii"),
+        )
+        .with_webhook_secret(
+            config.termii_webhook_secret.as_ref().map(|s| s.as_str().to_string()),
         )),
         OtpProviderKind::Mock => std::sync::Arc::new(otp::mock::MockOtpProvider),
     };
@@ -114,6 +120,7 @@ pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::er
         cookie: config.cookie,
         admin_events,
         daily_withdrawal_limit_stroops: config.daily_withdrawal_limit_stroops,
+        cngn_issuer: config.cngn_issuer_address.clone().map(std::sync::Arc::new),
     })
 }
 
@@ -143,6 +150,10 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/verify-otp", axum::routing::post(api::auth::verify_otp))
         .route("/logout", axum::routing::post(api::auth::logout))
         .route("/auth/refresh", axum::routing::post(api::auth::refresh))
+        .route(
+            "/webhooks",
+            axum::routing::post(api::merchant_webhooks::create).get(api::merchant_webhooks::list),
+        )
         .route("/webhooks/termii", axum::routing::post(api::webhooks::termii))
         .route("/webhooks/paystack", axum::routing::post(api::webhooks::paystack))
         .route(
@@ -246,6 +257,7 @@ mod cors_tests {
             cookie: CookieConfig { secure: true, same_site: SameSite::Lax },
             admin_events: broadcast::channel(16).0,
             daily_withdrawal_limit_stroops: None,
+            cngn_issuer: None,
         }
     }
 

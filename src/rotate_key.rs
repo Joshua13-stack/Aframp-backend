@@ -31,14 +31,13 @@
 //! a transition window instead of assuming exactly one key is ever current.
 
 use sqlx::postgres::PgPoolOptions;
-use uuid::Uuid;
 
 use crate::blockchain::wallet_crypto;
 
-/// Runs the rotation. Returns `Err` (and leaves every already-rotated row on
-/// the new key) if any row fails to decrypt with the old key or the two keys
-/// are identical. A partial rotation is safe to re-run: rows already on the
-/// new key are recognised and skipped.
+/// Runs the rotation. Every wallet is re-encrypted in one transaction (see
+/// `services::wallets::rotate_encryption_key`), so if any row fails to
+/// decrypt with the old key nothing changes; each decryption is recorded in
+/// `wallet_secret_access_log`.
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = require_env("DATABASE_URL")?;
     let old_key = wallet_crypto::parse_key(&require_env("WALLET_ENCRYPTION_KEY")?)?;
@@ -52,60 +51,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .connect(&database_url)
         .await?;
 
-    let rows: Vec<(Uuid, String)> =
-        sqlx::query_as("SELECT id, secret_key_encrypted FROM wallets")
-            .fetch_all(&db)
-            .await?;
-
-    let total = rows.len();
-    tracing::info!(total, "starting WALLET_ENCRYPTION_KEY rotation");
-
-    let mut rotated = 0usize;
-    let mut already_rotated = 0usize;
-    let mut failed = 0usize;
-
-    for (id, encrypted) in rows {
-        let plaintext = match wallet_crypto::decrypt(&old_key, &encrypted) {
-            Ok(p) => p,
-            // A re-run after a partial rotation: this row is already on the
-            // new key, so there's nothing to do for it.
-            Err(_) if wallet_crypto::decrypt(&new_key, &encrypted).is_ok() => {
-                already_rotated += 1;
-                continue;
-            }
-            Err(err) => {
-                failed += 1;
-                tracing::error!(wallet_id = %id, error = %err, "failed to decrypt with WALLET_ENCRYPTION_KEY; row left untouched");
-                continue;
-            }
-        };
-        let re_encrypted = wallet_crypto::encrypt(&new_key, &plaintext)?;
-
-        // A single UPDATE is already atomic per row: either this wallet's
-        // ciphertext moves to the new key or it doesn't, never a partial
-        // write. There's no multi-statement unit of work here that needs an
-        // explicit transaction.
-        sqlx::query("UPDATE wallets SET secret_key_encrypted = $2 WHERE id = $1")
-            .bind(id)
-            .bind(&re_encrypted)
-            .execute(&db)
-            .await?;
-        rotated += 1;
-    }
-
-    tracing::info!(rotated, already_rotated, failed, total, "WALLET_ENCRYPTION_KEY rotation finished");
-
-    if failed > 0 {
-        return Err(format!(
-            "{failed} of {total} wallet row(s) could not be decrypted with WALLET_ENCRYPTION_KEY \
-             and were left untouched — see logs above for wallet ids. Do not switch the deployment \
-             to WALLET_ENCRYPTION_KEY_NEW yet; investigate those rows and re-run this command."
-        )
-        .into());
-    }
-
+    let total = crate::services::wallets::rotate_encryption_key(&db, &old_key, &new_key).await?;
     println!(
-        "Rotation complete: {rotated} wallet(s) re-encrypted with WALLET_ENCRYPTION_KEY_NEW.\n\
+        "Rotation complete: {total} wallet(s) re-encrypted with WALLET_ENCRYPTION_KEY_NEW.\n\
          Next: set the deployment's WALLET_ENCRYPTION_KEY to the value you used for \
          WALLET_ENCRYPTION_KEY_NEW, restart the server, and discard the old key."
     );

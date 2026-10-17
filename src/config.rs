@@ -88,6 +88,13 @@ pub struct AppConfig {
     /// Required when `otp_provider` is `Termii`; absent when it's `Mock`.
     pub termii_api_key: Option<SecretString>,
     pub termii_sender_id: Option<String>,
+    /// Optional dedicated secret for verifying `X-Termii-Signature` on the
+    /// delivery-status webhook. Falls back to `termii_api_key` when unset.
+    pub termii_webhook_secret: Option<SecretString>,
+    /// Stellar account that issues cNGN (`CNGNX_ISSUER_ADDRESS`). cNGN
+    /// payment requests only get a SEP-0007 URI when this is set — a guessed
+    /// issuer would silently misdirect a customer's payment.
+    pub cngn_issuer_address: Option<String>,
     /// Browser origins allowed to call this API. The merchant frontend is a
     /// separate origin, so without this every request fails CORS preflight.
     pub cors_allowed_origins: Vec<String>,
@@ -130,6 +137,19 @@ impl AppConfig {
             "mock" => OtpProviderKind::Mock,
             other => return Err(format!("OTP_PROVIDER must be `termii` or `mock`, got `{other}`")),
         };
+        let cngn_issuer_address = match std::env::var("CNGNX_ISSUER_ADDRESS") {
+            Ok(value) if !value.trim().is_empty() => {
+                let value = value.trim().to_string();
+                if stellar_strkey::ed25519::PublicKey::from_string(&value).is_err() {
+                    return Err(format!(
+                        "CNGNX_ISSUER_ADDRESS must be a Stellar account ID (G...), got `{value}`"
+                    ));
+                }
+                Some(value)
+            }
+            _ => None,
+        };
+
         let (termii_api_key, termii_sender_id) = if otp_provider == OtpProviderKind::Termii {
             (
                 Some(SecretString::new(env("TERMII_API_KEY")?)),
@@ -220,6 +240,11 @@ impl AppConfig {
                 &std::env::var("CORS_ALLOWED_ORIGINS")
                     .unwrap_or_else(|_| "http://localhost:3001".into()),
             )?,
+            termii_webhook_secret: std::env::var("TERMII_WEBHOOK_SECRET")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .map(SecretString::new),
+            cngn_issuer_address,
             cookie: CookieConfig {
                 secure: cookie_secure,
                 same_site: cookie_same_site,
@@ -504,6 +529,8 @@ mod tests {
                 otp_provider: OtpProviderKind::Termii,
                 termii_api_key: Some(SecretString::new("termii-key".to_string())),
                 termii_sender_id: Some("Aframp".to_string()),
+                termii_webhook_secret: Some(SecretString::new("termii-webhook-secret".to_string())),
+                cngn_issuer_address: None,
                 cors_allowed_origins: vec!["http://localhost:3001".to_string()],
                 cookie: CookieConfig {
                     secure: true,
@@ -519,6 +546,7 @@ mod tests {
         assert!(!config_debug.contains("paystack-key"));
         assert!(!config_debug.contains("otp-hmac-secret-value"));
         assert!(!config_debug.contains("termii-key"));
+        assert!(!config_debug.contains("termii-webhook-secret"));
     }
 
     #[test]

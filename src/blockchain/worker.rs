@@ -6,7 +6,7 @@ use tracing::Instrument;
 
 use crate::blockchain::stellar::{AddressCursor, BlockchainListener, DetectedDeposit, StellarListener};
 use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus};
-use crate::services::{balances, payment_requests, payments, wallets};
+use crate::services::{balances, merchant_webhooks, payment_requests, payments, wallets};
 use crate::AppState;
 
 pub async fn run(
@@ -25,7 +25,12 @@ pub async fn run(
             poll_concurrency,
             poll_cycle_duration_ms = tracing::field::Empty
         );
-        let result = poll_once_with_confirmations(&state.db, &listener, min_confirmations)
+        let result = poll_once_with_confirmations(
+            &state.db,
+            &listener,
+            min_confirmations,
+            Some(state.webhook_secret.as_str()),
+        )
             .instrument(span.clone())
             .await;
         span.record("poll_cycle_duration_ms", started.elapsed().as_millis() as u64);
@@ -46,7 +51,7 @@ pub async fn poll_once<L: BlockchainListener + ?Sized>(
     db: &PgPool,
     listener: &L,
 ) -> Result<(), String> {
-    poll_once_with_confirmations(db, listener, 1).await
+    poll_once_with_confirmations(db, listener, 1, None).await
 }
 
 /// One poll pass: record newly detected deposits (credited to `pending`),
@@ -57,6 +62,7 @@ pub async fn poll_once_with_confirmations<L: BlockchainListener + ?Sized>(
     db: &PgPool,
     listener: &L,
     min_confirmations: i32,
+    webhook_secret: Option<&str>,
 ) -> Result<(), String> {
     // Deposits already waiting gain a confirmation for this pass; new ones
     // recorded below start at one.
@@ -102,7 +108,7 @@ pub async fn poll_once_with_confirmations<L: BlockchainListener + ?Sized>(
             tracing::warn!(error = %err, address = %result.address, "failed to persist poll cursor");
         }
     }
-    promote_confirmed_deposits(db, min_confirmations).await
+    promote_and_notify(db, min_confirmations, webhook_secret).await
 }
 
 /// Second pass: every verified deposit gains one confirmation per poll pass,
@@ -111,13 +117,51 @@ pub async fn poll_once_with_confirmations<L: BlockchainListener + ?Sized>(
 /// re-sighting) is what makes this work with cursor-based polling, which
 /// only ever fetches a given operation once.
 pub async fn promote_confirmed_deposits(db: &PgPool, min_confirmations: i32) -> Result<(), String> {
+    promote_and_notify(db, min_confirmations, None).await
+}
+
+/// [`promote_confirmed_deposits`], then queue a `payment.confirmed` webhook
+/// to the merchant for each newly confirmed deposit when `webhook_secret` is
+/// given. Delivery (with retries) runs in the background and never fails
+/// deposit processing.
+async fn promote_and_notify(
+    db: &PgPool,
+    min_confirmations: i32,
+    webhook_secret: Option<&str>,
+) -> Result<(), String> {
     let promoted = payments::promote_confirmed(db, min_confirmations)
         .await
         .map_err(|e| e.to_string())?;
-    if promoted > 0 {
-        tracing::info!(promoted, min_confirmations, "deposits confirmed");
+    if !promoted.is_empty() {
+        tracing::info!(promoted = promoted.len(), min_confirmations, "deposits confirmed");
+    }
+    let Some(secret) = webhook_secret else { return Ok(()) };
+    for payment in &promoted {
+        if let Err(err) = merchant_webhooks::dispatch(
+            db,
+            webhook_http_client(),
+            secret,
+            payment.merchant_id,
+            merchant_webhooks::PAYMENT_CONFIRMED,
+            &merchant_webhooks::payment_confirmed_payload(payment),
+            merchant_webhooks::RetryPolicy::default(),
+        )
+        .await
+        {
+            tracing::warn!(error = %err, payment_id = %payment.id, "failed to queue payment.confirmed webhooks");
+        }
     }
     Ok(())
+}
+
+fn webhook_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("failed to build webhook HTTP client")
+    })
 }
 
 #[tracing::instrument(skip_all, err, fields(tx_hash = %d.tx_hash, destination = %d.destination, amount_stroops = d.amount_stroops, asset = %d.asset))]
@@ -189,7 +233,6 @@ pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), Stri
         }
     }
 
-    // TODO: dispatch payment.confirmed webhook.
     Ok(())
 }
 

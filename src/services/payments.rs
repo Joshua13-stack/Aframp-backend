@@ -345,8 +345,8 @@ pub async fn bump_confirmations(db: &PgPool, id: Uuid) -> Result<(), sqlx::Error
 
 /// Promotes every verified deposit with at least `min_confirmations` to
 /// `confirmed`, moving its amount from `pending` to `available` in the same
-/// transaction. Returns how many were promoted.
-pub async fn promote_confirmed(db: &PgPool, min_confirmations: i32) -> Result<u64, sqlx::Error> {
+/// transaction. Returns the promoted payments.
+pub async fn promote_confirmed(db: &PgPool, min_confirmations: i32) -> Result<Vec<Payment>, sqlx::Error> {
     let ready = sqlx::query_as::<_, Payment>(
         "SELECT id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
                 network, status, confirmations, created_at, updated_at
@@ -357,7 +357,7 @@ pub async fn promote_confirmed(db: &PgPool, min_confirmations: i32) -> Result<u6
     .fetch_all(db)
     .await?;
 
-    let mut promoted = 0;
+    let mut promoted = Vec::new();
     for p in ready {
         let mut tx = db.begin().await?;
         // Guarded on status so a concurrent pass can't promote it twice.
@@ -384,7 +384,7 @@ pub async fn promote_confirmed(db: &PgPool, min_confirmations: i32) -> Result<u6
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        promoted += 1;
+        promoted.push(p);
     }
     Ok(promoted)
 }

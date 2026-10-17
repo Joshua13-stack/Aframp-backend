@@ -215,3 +215,33 @@ async fn transactions_list_supports_etag_revalidation() {
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 }
+
+#[tokio::test]
+async fn decrypting_a_wallet_secret_writes_an_audit_log_entry() {
+    let state = state().await;
+    let app = aframp::router(state.clone());
+    let (token, _) = ensure_merchant(&app, "secret_audit").await;
+
+    let (status, json) = send(app.clone(), "POST", "/wallet/create", Some(&token), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "create wallet failed: {json}");
+    let wallet_id: uuid::Uuid = json["id"].as_str().unwrap().parse().unwrap();
+
+    let secret = aframp::services::wallets::decrypt_secret(
+        &state.db,
+        wallet_id,
+        &state.wallet_encryption_key,
+        "integration_test",
+    )
+    .await
+    .expect("decrypt should succeed with the state's key");
+    assert!(secret.starts_with('S'), "expected a Stellar secret seed");
+
+    let purposes: Vec<String> = sqlx::query_scalar(
+        "SELECT purpose FROM wallet_secret_access_log WHERE wallet_id = $1 ORDER BY accessed_at",
+    )
+    .bind(wallet_id)
+    .fetch_all(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(purposes, vec!["integration_test".to_string()]);
+}
