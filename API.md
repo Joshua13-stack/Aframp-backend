@@ -347,6 +347,24 @@ Errors: `400` `OTP_INVALID` (wrong code — 5 wrong guesses and the challenge is
 ### `POST /auth/refresh`
 Auth required (bearer or session cookie; the token must not have expired). Returns a new token with the same body shape as `/verify-otp` and resets the session cookie. The new token expires 24h from now, but never more than 7 days after the original login; past that point this returns `401` ("session can no longer be refreshed; log in again"). Refresh doesn't revoke the old token — it stays valid until its own `exp`.
 
+### `GET /verify-email`
+No auth. Consumes the single-use, 24-hour token from the verification email
+sent when a signup completes or a resend is requested.
+
+```
+GET /verify-email?token=<hex-token>
+```
+
+`200` → `{ "email_verified": true }`. Unknown, already-used, or expired tokens
+return `400` `INVALID_PARAMETERS` ("invalid or expired email verification
+token"), and an empty `token` returns `400` with `field: "token"`.
+
+### `POST /verify-email/resend`
+Auth required. Issues a fresh verification link for the signed-in account,
+invalidating any previous token. Returns `200` `{ "sent": true }`. Because no
+transactional email provider is wired into the backend yet, the link is emitted
+through structured logs (`verification_link`).
+
 ### `POST /logout`
 No auth — a browser holding an expired or malformed session still needs to clear it. Returns `204` and a `Set-Cookie` that expires `aframp_session` immediately.
 
