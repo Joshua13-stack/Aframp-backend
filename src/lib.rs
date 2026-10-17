@@ -99,7 +99,7 @@ pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::er
         webhook_secret: config.webhook_secret.clone(),
         wallet_encryption_key: std::sync::Arc::new(wallet_encryption_key),
         payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
-            config.paystack_secret_key.as_str().to_string(),
+            config.paystack_secret_key.clone(),
         )),
         otp_provider,
         otp_hmac_secret: config.otp_hmac_secret.clone(),
@@ -214,7 +214,7 @@ pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::er
         webhook_secret: config.webhook_secret.clone(),
         wallet_encryption_key: std::sync::Arc::new(wallet_encryption_key),
         payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
-            config.paystack_secret_key.as_str().to_string(),
+            config.paystack_secret_key.clone(),
         )),
         otp_provider,
         otp_hmac_secret: config.otp_hmac_secret.clone(),
@@ -294,7 +294,7 @@ mod cors_tests {
             webhook_secret: SecretString::new("test-webhook-secret".to_string()),
             wallet_encryption_key: std::sync::Arc::new([0u8; 32]),
             payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
-                "test-paystack-key".to_string(),
+                SecretString::new("test-paystack-key".to_string()),
             )),
             otp_provider: std::sync::Arc::new(otp::mock::MockOtpProvider),
             otp_hmac_secret: SecretString::new("test-otp-hmac-secret".to_string()),
