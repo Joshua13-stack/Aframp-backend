@@ -54,9 +54,7 @@ async fn create_and_fetch_wallet() {
 
 #[tokio::test]
 async fn get_wallet_returns_404_when_not_created() {
-    let Some(app) = app().await else {
-        return;
-    };
+    let app = app().await;
     let (token, _) = ensure_merchant(&app, "wallet_missing").await;
 
     let (status, json) = send(app.clone(), "GET", "/wallet", Some(&token), None).await;
@@ -84,9 +82,7 @@ async fn balance_and_transactions_start_empty() {
 
 #[tokio::test]
 async fn create_wallet_twice_is_rejected() {
-    let Some(app) = app().await else {
-        return;
-    };
+    let app = app().await;
     let (token, _) = ensure_merchant(&app, "dup_wallet").await;
 
     let (status, json) = send(
@@ -172,9 +168,7 @@ async fn backed_off_wallet_is_excluded_from_poll_query() {
 /// and any funds held in it).
 #[tokio::test]
 async fn second_wallet_create_returns_409() {
-    let Some(app) = app().await else {
-        return;
-    };
+    let app = app().await;
     let (token, _) = ensure_merchant(&app, "dup_wallet").await;
 
     // First call succeeds and returns the new wallet.
