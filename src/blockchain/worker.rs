@@ -60,21 +60,19 @@ async fn poll_once(
     Ok(())
 }
 
-async fn process_deposit(
-    db: &PgPool,
-    d: crate::blockchain::stellar::DetectedDeposit,
-) -> Result<(), BlockchainError> {
-    let Some(wallet) = wallets::wallet_by_address(db, &d.destination)
-        .await
-        .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?
 /// Returns true only when the deposit's destination is exactly the address of
 /// the wallet that would be credited.
 pub fn destination_matches_wallet(wallet_address: &str, destination: &str) -> bool {
     wallet_address == destination
 }
 
-pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), String> {
-    let Some(wallet) = wallets::wallet_by_address(db, &d.destination).await.map_err(|e| e.to_string())?
+pub async fn process_deposit(
+    db: &PgPool,
+    d: crate::blockchain::stellar::DetectedDeposit,
+) -> Result<(), BlockchainError> {
+    let Some(wallet) = wallets::wallet_by_address(db, &d.destination)
+        .await
+        .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?
     else {
         return Ok(());
     };
@@ -197,6 +195,37 @@ mod tests {
     use super::*;
     use crate::models::NewPayment;
     use crate::services::{balances, payments, wallets};
+
+    /// A deposit whose destination doesn't resolve to a known wallet must be
+    /// skipped without recording a payment or crediting any merchant.
+    #[sqlx::test]
+    async fn deposit_to_unknown_destination_is_skipped(db: PgPool) {
+        let merchant_id = uuid::Uuid::new_v4();
+        wallets::create(
+            &db,
+            crate::models::NewWallet {
+                merchant_id,
+                address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+                network: "stellar".into(),
+            },
+        )
+        .await
+        .expect("create wallet");
+
+        let deposit = crate::blockchain::stellar::DetectedDeposit {
+            tx_hash: "mismatch".into(),
+            destination: "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBWHF".into(),
+            amount_stroops: 1_000,
+            asset: "XLM".into(),
+            memo: None,
+        };
+        process_deposit(&db, deposit).await.expect("process_deposit");
+
+        let rows = payments::payments_by_merchant(&db, merchant_id, 10)
+            .await
+            .expect("list payments");
+        assert!(rows.is_empty(), "mismatched destination must not be credited");
+    }
 
     /// Simulates a crash between `record_deposit` (which inserts a row with
     /// status `detected`) and `set_status(Verified)`. On the next poll cycle
