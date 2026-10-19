@@ -311,9 +311,13 @@ pay.example.com {
 }
 ```
 
-Caddy provisions and renews the certificate itself. With this, the frontend calls `/api/me` as a relative path, sends no `Authorization` header, and never touches the token.
+Caddy provisions and renews the certificate itself. The `Strict-Transport-Security` line above is what enforces HTTPS on repeat visits: the Axum app does **not** set HSTS itself today, so if you deploy without Caddy (or with a proxy that doesn't add it), add `Strict-Transport-Security: max-age=31536000; includeSubDomains` at your proxy. The plan is for the app to emit it whenever `COOKIE_SECURE=true` and skip it in plain-HTTP dev mode — see [`docs/proposals/1248-hsts-header.md`](docs/proposals/1248-hsts-header.md). With this, the frontend calls `/api/me` as a relative path, sends no `Authorization` header, and never touches the token.
 
 If the frontend genuinely must live on a separate origin, set `CORS_ALLOWED_ORIGINS` to it and `COOKIE_SAME_SITE=none` — and understand that you have then opted into cross-site cookie sending and need to think about CSRF. (Today's saving grace is that every mutating route uses the JSON extractor, so a cross-site HTML form POST can't reach one; don't rely on that if you add form-encoded endpoints.)
+
+## Metrics
+
+There is no `/metrics` endpoint yet. The planned design — Prometheus text format on a separate `APP_METRICS_ADDR` listener (disabled by default, never on the public port) with deposit-worker and auth instrumentation — is in [`docs/proposals/1250-prometheus-metrics.md`](docs/proposals/1250-prometheus-metrics.md).
 
 ## Project layout
 

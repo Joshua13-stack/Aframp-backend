@@ -1266,6 +1266,21 @@ components:
           nullable: true
           description: Present when status is paid (row updated_at at mark-paid).
 
+    BalanceEnvelope:
+      type: object
+      description: >
+        Planned GET /balance response shape (#1247, not yet served). One entry
+        per supported asset, zero-filled when the merchant has no deposits.
+      required: [supported_assets, balances]
+      properties:
+        supported_assets:
+          type: array
+          items: { type: string, enum: [XLM, cNGN] }
+          example: [XLM, cNGN]
+        balances:
+          type: array
+          items: { $ref: '#/components/schemas/Balance' }
+
     Balance:
       type: object
       required: [merchant_id, asset, available, pending, updated_at]
