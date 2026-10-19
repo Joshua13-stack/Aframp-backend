@@ -322,6 +322,14 @@ impl OtpProvider for MockOtpProvider {
             _ => OtpError::Database(err),
         })?;
 
+    // Account is materialized; now kick off email verification. A delivery
+    // failure must not fail signup (the merchant can resend), so errors are
+    // logged but swallowed.
+    match crate::services::email_verification::issue_token(db, user.id).await {
+        Ok(token) => crate::services::email_verification::send_verification_email(email, &token),
+        Err(err) => tracing::warn!(error = %err, "failed to issue email verification token"),
+    }
+
     Ok(VerifiedOutcome::Signup(user, merchant))
 }
 
@@ -380,6 +388,18 @@ async fn upsert_challenge(
         let code = generate_code();
         let code_hash = hash_code(hmac_secret, id, &code);
         let expires_at = Utc::now() + Duration::seconds(CODE_TTL_SECS);
+        // A resend (re-POST to /signup) intentionally overwrites every pending
+        // signup field, not just the code. The signup handler re-hashes the
+        // password the client just sent and passes it in as
+        // `pending_password_hash`, so if the user changed their password
+        // between the original POST and this resend, the *new* hash is stored
+        // and is what `verify` will hand to `create_verified` when it finally
+        // creates the account. That is deliberate: the challenge is still
+        // unverified, no `users` row exists yet, and the password the user most
+        // recently typed is the one that should take effect. It is not a
+        // security concern because account creation still requires the OTP sent
+        // to the phone number on the challenge — updating the pending password
+        // cannot be triggered or observed by anyone who does not hold the code.
         sqlx::query(
             "UPDATE otp_challenges
                 SET code_hash = $2, attempts = 0, expires_at = $3, last_sent_at = now(),

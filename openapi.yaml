@@ -234,6 +234,41 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Change the signed-in user's password
+      description: >
+        Requires the current password even with a valid session. On success
+        the password is replaced and every session issued before the change
+        (including refreshed ones) is revoked; the caller receives a fresh
+        token, also set as the session cookie.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        '200':
+          description: Password changed; new session token
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: aframp_session with the new token
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthResponse' }
+        '400':
+          description: >
+            `new_password` shorter than 8 characters, or `current_password`
+            incorrect (see the `field` property).
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /me:
     get:
       tags: [Auth]
@@ -354,6 +389,28 @@ paths:
               schema: { $ref: '#/components/schemas/ApiError' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /merchants/me:
+    get:
+      tags: [Merchant]
+      summary: Current user's merchant profile
+      description: >
+        Returns the full Merchant model for the signed-in user, separate from
+        GET /me which carries only the auth-identity fields. Use this to render
+        richer merchant/business profile data without bloating /me.
+      responses:
+        '200':
+          description: Merchant profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: MERCHANT_NOT_FOUND — the signed-in user has no merchant profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /wallet:
@@ -577,6 +634,18 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
+        - name: asset
+          in: query
+          required: false
+          description: Only return payments in this asset (exact match, e.g. XLM, cNGN).
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          description: Only return payments with this status. Unknown values return 400 INVALID_PARAMETERS.
+          schema:
+            type: string
+            enum: [detected, verified, confirmed, failed]
       responses:
         '200':
           description: Payments, newest first
@@ -627,6 +696,105 @@ paths:
               schema: { $ref: '#/components/schemas/AnalyticsResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /analytics/payments:
+    get:
+      tags: [Analytics]
+      summary: Daily payment volume for the authenticated merchant
+      description: >
+        Returns daily aggregates of confirmed payments for the authenticated
+        merchant within the requested date range. Only payments with status
+        `confirmed` are included — `detected` and `verified` payments are
+        still in-flight and excluded. All timestamps and date keys are UTC.
+        Amounts are always integer stroops (1 XLM = 10,000,000 stroops).
+
+
+        **Default range:** last 30 days (today minus 29 days through today
+        inclusive, UTC).  Supply `from` and/or `to` to override.  At most
+        366 days may be requested in a single call; a wider window returns
+        400 INVALID_PARAMETERS.
+
+
+        **Implementation notes for the backend (issue #1266):**
+
+        - Query: `SELECT DATE(created_at AT TIME ZONE 'UTC') AS date, COUNT(*) AS
+          count, SUM(amount_stroops) AS total_stroops, asset FROM payments WHERE
+          merchant_id = $1 AND status = 'confirmed' AND created_at >= $2 AND
+          created_at < $3 GROUP BY 1, asset ORDER BY 1`.
+
+        - A DB index on `payments(merchant_id, status, created_at)` is required
+          to keep this query sub-millisecond at scale.
+
+        - Dates with zero activity are **omitted** from the response array
+          (sparse representation); clients must fill gaps themselves.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: >
+            Start date, inclusive. ISO 8601 calendar date (`YYYY-MM-DD`).
+            Interpreted as midnight UTC. Defaults to today minus 29 days.
+          schema:
+            type: string
+            format: date
+            example: '2026-09-19'
+        - name: to
+          in: query
+          required: false
+          description: >
+            End date, inclusive. ISO 8601 calendar date (`YYYY-MM-DD`).
+            Interpreted as 23:59:59.999 UTC. Defaults to today.
+          schema:
+            type: string
+            format: date
+            example: '2026-10-19'
+      responses:
+        '200':
+          description: Daily payment volume aggregates for the requested window.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [from, to, data]
+                properties:
+                  from:
+                    type: string
+                    format: date
+                    description: Actual start date used (after defaulting), inclusive.
+                    example: '2026-09-19'
+                  to:
+                    type: string
+                    format: date
+                    description: Actual end date used (after defaulting), inclusive.
+                    example: '2026-10-19'
+                  data:
+                    type: array
+                    description: >
+                      Sparse list of days that had at least one confirmed payment.
+                      Ordered by `date` ascending.
+                    items:
+                      $ref: '#/components/schemas/DailyPaymentAggregate'
+              example:
+                from: '2026-09-19'
+                to: '2026-10-19'
+                data:
+                  - date: '2026-10-01'
+                    count: 3
+                    total_stroops: 30000000
+                    asset: XLM
+                  - date: '2026-10-03'
+                    count: 1
+                    total_stroops: 5000000
+                    asset: XLM
+        '400':
+          description: >
+            INVALID_PARAMETERS — malformed `from`/`to` date, `from` is after
+            `to`, or the window exceeds 366 days.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /withdraw:
     post:
@@ -1156,6 +1324,20 @@ components:
         merchant_id: { type: string, format: uuid, nullable: true }
         merchant_name: { type: string, nullable: true }
 
+    Merchant:
+      type: object
+      required: [id, user_id, name, email_notifications_enabled, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email, nullable: true }
+        email_notifications_enabled: { type: boolean }
+        unsubscribe_token: { type: string, nullable: true }
+        suspended_at: { type: string, format: date-time, nullable: true, description: Set when the merchant account is suspended. }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
     CreateWalletRequest:
       type: object
       properties:
@@ -1295,6 +1477,36 @@ components:
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
+    DailyPaymentAggregate:
+      type: object
+      required: [date, count, total_stroops, asset]
+      description: >
+        Aggregated confirmed-payment statistics for a single calendar day and
+        asset. Days with no confirmed payments are omitted from the response
+        (sparse representation).
+      properties:
+        date:
+          type: string
+          format: date
+          description: UTC calendar date of the aggregation bucket.
+          example: '2026-10-01'
+        count:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Number of confirmed payments on this date for this asset.
+          example: 3
+        total_stroops:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Sum of `amount_stroops` for all confirmed payments in this bucket.
+          example: 30000000
+        asset:
+          type: string
+          description: Asset code (e.g. `XLM`, `cNGN`).
+          example: XLM
+
     AnalyticsResponse:
       type: object
       required: [period, daily, total_paid_requests, success_rate]
@@ -1330,10 +1542,12 @@ components:
           type: integer
           format: int64
           description: >
-            Must be a whole multiple of 100000 (1 kobo). Paystack's minimum
-            transfer is NGN 50 = 500000000 stroops. Must be a JSON integer —
-            floats and strings are rejected with INVALID_PARAMETERS on field
-            amount_stroops.
+            Amount in cNGN stroops (1 cNGN = 10,000,000 stroops; 1 cNGN stroop
+            = 100,000 kobo). Must be a whole multiple of 100000 (1 kobo).
+            Paystack's minimum transfer is NGN 50 = 500000000 stroops. Must be
+            a JSON integer — floats and strings are rejected with
+            INVALID_PARAMETERS on field amount_stroops. Never send whole units:
+            NGN 2,500 is 25,000,000,000 stroops, not 2500.
           example: 500000000
         asset:
           type: string
@@ -1467,7 +1681,11 @@ components:
         merchant_name: { type: string }
         wallet_address: { type: string }
         tx_hash: { type: string }
-        amount_stroops: { type: integer, format: int64 }
+        amount_stroops:
+          type: integer
+          format: int64
+          description: "Amount in stroops (1 unit = 10,000,000 stroops). 1 cNGN stroop = 100,000 kobo."
+          example: 25000000
         asset: { type: string }
         network: { type: string, example: stellar }
         status: { type: string, enum: [detected, verified, confirmed, failed] }
@@ -1482,7 +1700,11 @@ components:
         id: { type: string, format: uuid }
         merchant_id: { type: string, format: uuid }
         merchant_name: { type: string }
-        amount_stroops: { type: integer, format: int64 }
+        amount_stroops:
+          type: integer
+          format: int64
+          description: "Amount in stroops (1 unit = 10,000,000 stroops). 1 cNGN stroop = 100,000 kobo."
+          example: 25000000
         asset: { type: string }
         status: { type: string, enum: [pending, processing, completed, failed] }
         provider: { type: string, nullable: true }
@@ -1500,7 +1722,11 @@ components:
         id: { type: string, format: uuid }
         merchant_id: { type: string, format: uuid }
         merchant_name: { type: string }
-        amount_stroops: { type: integer, format: int64 }
+        amount_stroops:
+          type: integer
+          format: int64
+          description: "Amount in stroops (1 unit = 10,000,000 stroops). 1 cNGN stroop = 100,000 kobo."
+          example: 25000000
         asset: { type: string }
         memo: { type: string }
         status: { type: string, enum: [pending, paid, expired] }

@@ -54,7 +54,7 @@ This section is deliberately literal: everything marked ✅ has been exercised e
 | QR-based payment (cNGN) | `sep7_uri` is `null` for cNGN payment requests — there's no real cNGN issuer Stellar address configured, and a guessed one would silently misdirect a customer's payment. Works for XLM today; cNGN needs a real issuer address sourced first |
 | Real payout funding ("Stage A") | Paystack Transfers are wired and code-correct (see above), but Paystack's own business-account balance is ₦0 — `source: "balance"` transfers have nothing to draw from. Confirmed live: a real bank account + valid amount still failed with *"Your balance is not enough to fulfil this request."* Nothing pays out until there's a real crypto→fiat funding pipeline (e.g. cNGN issuer redemption) |
 | Confirmation-depth threshold | Implemented, but shallow by default: each detected deposit records the ledger sequence it landed in, and the worker only promotes `pending → available` once `STELLAR_MIN_CONFIRMATIONS` (default `1`) ledger closes have passed. With the default of `1` that's effectively immediate on Stellar's fast finality; raising the setting is what actually buys reorg protection. There's no per-asset or per-merchant override yet |
-| Settlement/sweep wallet | Each merchant's Stellar secret is held (encrypted) by the platform, but nothing yet sweeps funds from individual merchant wallets into a platform settlement wallet. `STELLAR_SYSTEM_WALLET_ADDRESS` is still validated at startup and reserved for this, but isn't used by anything yet |
+| Settlement/sweep wallet | Each merchant's Stellar secret is held (encrypted) by the platform, but nothing yet sweeps funds from individual merchant wallets into a platform settlement wallet. `STELLAR_SYSTEM_WALLET_ADDRESS` is still validated at startup and reserved for this, but isn't used by anything yet. See [`docs/settlement-sweep-wallet.md`](docs/settlement-sweep-wallet.md) for the full implementation plan (issue [#1276](https://github.com/kellymusk/Aframp-backend/issues/1276)) |
 | TLS | The server speaks plain HTTP by design and must run behind a TLS-terminating reverse proxy. Deployed without one, passwords cross the network in cleartext and no amount of hashing helps — the attacker sees the password before it is hashed. See [Deploying behind TLS](#deploying-behind-tls) |
 | Login rate limiting | Nothing throttles password guessing against `/login` yet |
 | Token revocation | `POST /logout` clears the browser cookie, but a JWT already copied elsewhere stays valid for its full 24h. No revocation list, no refresh rotation |
@@ -149,6 +149,8 @@ The server starts on `APP_BIND_ADDR` (default `http://127.0.0.1:3000`) and spawn
 See **[`command.txt`](command.txt)** for a copy-paste reference of every command used to run, test, and interact with this backend — curl calls for every endpoint, secret generation, and DB lifecycle commands.
 
 ### Cloudflare Containers
+
+> **Deploying to production?** See **[DEPLOY.md](DEPLOY.md)** for the full guide: prerequisites, secrets, the environment-variable checklist, the single-instance constraint, the cron keepalive, Caddy, and post-deploy verification. The summary below is kept for quick reference.
 
 This repository includes a Cloudflare Container deployment scaffold. It runs the existing Axum binary in a single named container, with the `aframp-backend` Worker acting as the public HTTPS proxy. The single instance is intentional: multiple instances would each run the Stellar polling loop and duplicate work.
 
@@ -356,4 +358,8 @@ making changes that touch the areas they cover.
 
 ## Contributing
 
-This project is under active MVP development — expect the API and schema to change as real payout funding, a real cNGN issuer address, and settlement sweeping land. Open an issue or PR against `master`.
+This project is under active MVP development — expect the API and schema to change as real payout funding, a real cNGN issuer address, and settlement sweeping land. Open an issue or PR against `dev-backend`.
+
+Before opening a PR, read **[`CONTRIBUTING.md`](CONTRIBUTING.md)** for the dev
+setup, the `dev-backend` contribution branch, protected paths, commit/PR
+conventions, and the checklist reviewers expect.
