@@ -7,9 +7,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-/// Default maximum request body size (1MB) used when `MAX_REQUEST_BODY_BYTES`
+/// Default maximum request body size (64KB) used when `MAX_REQUEST_BODY_BYTES`
 /// is not set. This is a request body limit, not a response body limit.
-const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 /// Resolve the request body limit from `MAX_REQUEST_BODY_BYTES`, falling back
 /// to [`DEFAULT_MAX_REQUEST_BODY_BYTES`] when unset or unparseable.

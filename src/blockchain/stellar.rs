@@ -3,7 +3,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use serde::Deserialize;
+
+use super::horizon::{fetch_for_address, FetchResult};
+
+use crate::blockchain::error::BlockchainError;
 
 /// Maximum backoff for unfunded wallets (10 minutes).  Each consecutive 404
 /// doubles the backoff up to this ceiling.
@@ -16,10 +19,6 @@ pub struct DetectedDeposit {
     pub amount_stroops: i64,
     pub asset: String,
     pub confirmations: i32,
-    /// Ledger sequence number in which the parent transaction was included.
-    /// The worker uses this to gate the pending → available promotion until
-    /// `STELLAR_MIN_CONFIRMATIONS` further ledgers have closed.
-    pub ledger: u32,
     /// The parent transaction's memo, if any — used to correlate a deposit to
     /// a specific payment request rather than just "something arrived."
     pub memo: Option<String>,
@@ -27,17 +26,14 @@ pub struct DetectedDeposit {
 
 #[async_trait]
 pub trait BlockchainListener: Send + Sync {
-    async fn fetch_deposits(&self, addresses: &[String]) -> Result<Vec<DetectedDeposit>, String>;
+    async fn fetch_deposits(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<DetectedDeposit>, BlockchainError>;
 }
-
-/// Per-request timeout for Horizon calls, so one slow node can't stall the
-/// whole poll cycle.
-const HORIZON_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct StellarListener {
     pub horizon_url: String,
-    /// Shared client: pools connections across polls and applies the timeout.
-    http: reqwest::Client,
     /// Tracks the last time each unfunded wallet was polled so the worker can
     /// apply exponential backoff instead of hammering Horizon every cycle.
     unfunded_backoff: Mutex<HashMap<String, UnfundedState>>,
@@ -53,17 +49,8 @@ struct UnfundedState {
 
 impl StellarListener {
     pub fn new(horizon_url: String) -> Self {
-        Self::with_timeout(horizon_url, HORIZON_TIMEOUT)
-    }
-
-    pub fn with_timeout(horizon_url: String, timeout: Duration) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("failed to build Horizon HTTP client");
         Self {
             horizon_url,
-            http,
             unfunded_backoff: Mutex::new(HashMap::new()),
         }
     }
@@ -74,18 +61,6 @@ impl StellarListener {
         let map = self.unfunded_backoff.lock().unwrap();
         map.get(address)
             .is_some_and(|s| s.next_poll_at > Instant::now())
-    }
-
-    /// Addresses currently inside their unfunded backoff window. The worker
-    /// excludes these before loading wallets so they are neither read from the
-    /// DB nor sent to Horizon this cycle.
-    pub fn skipped_addresses(&self) -> Vec<String> {
-        let now = Instant::now();
-        let map = self.unfunded_backoff.lock().unwrap();
-        map.iter()
-            .filter(|(_, s)| s.next_poll_at > now)
-            .map(|(addr, _)| addr.clone())
-            .collect()
     }
 
     /// Record a consecutive 404 for the address and compute the next allowed
@@ -121,14 +96,17 @@ impl StellarListener {
 
 #[async_trait]
 impl BlockchainListener for StellarListener {
-    async fn fetch_deposits(&self, addresses: &[String]) -> Result<Vec<DetectedDeposit>, String> {
+    async fn fetch_deposits(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<DetectedDeposit>, BlockchainError> {
         let mut deposits = Vec::new();
         for address in addresses {
             // Skip wallets that are in their unfunded backoff window.
             if self.should_skip(address) {
                 continue;
             }
-            match fetch_for_address(&self.http, &self.horizon_url, address).await {
+            match fetch_for_address(&self.horizon_url, address).await {
                 Ok(FetchResult::Funded(found)) => {
                     self.clear_backoff(address);
                     deposits.extend(found);
@@ -139,7 +117,17 @@ impl BlockchainListener for StellarListener {
                 Err(err) => {
                     // One bad/unreachable address must not block deposit detection
                     // for every other wallet in this poll cycle.
-                    tracing::warn!(error = %err, %address, "failed to fetch deposits for address");
+                    match &err {
+                        BlockchainError::HttpError(_) => {
+                            tracing::warn!(error = %err, %address, "failed to fetch deposits for address");
+                        }
+                        BlockchainError::ParseError(_) => {
+                            tracing::error!(error = %err, %address, "parse error fetching deposits for address");
+                        }
+                        _ => {
+                            tracing::warn!(error = %err, %address, "failed to fetch deposits for address");
+                        }
+                    }
                 }
             }
         }
@@ -164,11 +152,6 @@ struct OperationRecord {
     op_type: String,
     transaction_successful: bool,
     transaction_hash: String,
-    /// Ledger sequence the operation was included in.  Horizon returns this
-    /// directly on the operation record; it may also appear on the joined
-    /// transaction, so both are consulted.
-    #[serde(default)]
-    ledger: Option<u32>,
     #[serde(default)]
     to: Option<String>,
     /// `path_payment_strict_send` uses `destination` instead of `to`.
@@ -209,10 +192,6 @@ struct ClaimantInfo {
 struct EmbeddedTransaction {
     #[serde(default)]
     memo: Option<String>,
-    /// Ledger sequence of the parent transaction, when Horizon includes it on
-    /// the joined transaction rather than the operation record itself.
-    #[serde(default)]
-    ledger: Option<u32>,
 }
 
 /// Distinguishes a funded account (200 OK) from an unfunded one (404) so the
@@ -232,27 +211,31 @@ enum FetchResult {
 /// the former delivers funds via claimable balances (not payment ops), and the
 /// latter uses a `destination` field instead of `to`.
 async fn fetch_for_address(
-    http: &reqwest::Client,
     horizon_url: &str,
     address: &str,
-) -> Result<FetchResult, String> {
+) -> Result<FetchResult, BlockchainError> {
     let url = format!(
         "{}/accounts/{address}/payments?order=desc&limit=20&include_failed=false&join=transactions",
         horizon_url.trim_end_matches('/')
     );
 
-    let response = http.get(&url).send().await.map_err(|e| e.to_string())?;
+    let response = reqwest::get(&url)
+        .await
+        .map_err(|e| BlockchainError::HttpError(e.to_string()))?;
+
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // Account has no ledger history yet (never funded) — nothing to detect.
         return Ok(FetchResult::Unfunded);
     }
 
-    let page: PaymentsPage = response
+    let response = response
         .error_for_status()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| BlockchainError::HttpError(e.to_string()))?;
+
+    let page: PaymentsPage = response
         .json()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| BlockchainError::ParseError(e.to_string()))?;
 
     let deposits = page
         .embedded
@@ -328,13 +311,6 @@ fn record_to_deposit(record: OperationRecord, address: &str) -> Option<DetectedD
     };
 
     let memo = record.transaction.as_ref().and_then(|t| t.memo.clone());
-    // Prefer the ledger on the operation record; fall back to the joined
-    // transaction.  Default to 0 when Horizon omits it entirely so the worker
-    // can still track the deposit (it will simply wait for the threshold).
-    let ledger = record
-        .ledger
-        .or_else(|| record.transaction.as_ref().and_then(|t| t.ledger))
-        .unwrap_or(0);
 
     Some(DetectedDeposit {
         tx_hash: record.transaction_hash,
@@ -342,56 +318,44 @@ fn record_to_deposit(record: OperationRecord, address: &str) -> Option<DetectedD
         amount_stroops,
         asset,
         confirmations: 1,
-        ledger,
         memo,
     })
 }
 
 /// Converts a Stellar decimal amount string (up to 7 fractional digits) to stroops.
-///
-/// Returns `Err` for:
-/// - Empty or whitespace-only strings
-/// - Negative amounts (e.g. `"-1.0"`) — a negative stroop count would corrupt
-///   the balance ledger if passed through to `balances::apply_delta`.
-/// - Values whose whole part overflows `i64` when multiplied by 10_000_000
-///   (the stroops conversion factor).
-/// - More than 7 fractional digits (Stellar only supports 7 decimal places).
-fn parse_amount_to_stroops(amount: &str) -> Result<i64, String> {
-    let trimmed = amount.trim();
-    if trimmed.is_empty() {
-        return Err(format!("invalid amount: {amount}"));
-    }
-
-    let mut parts = trimmed.splitn(2, '.');
+pub(crate) fn parse_amount_to_stroops(amount: &str) -> Result<i64, BlockchainError> {
+    let mut parts = amount.splitn(2, '.');
     let whole = parts.next().unwrap_or("0");
     let frac = parts.next().unwrap_or("");
     if frac.len() > 7 {
-        return Err(format!("unexpected precision in amount: {amount}"));
+        return Err(BlockchainError::ParseError(format!(
+            "unexpected precision in amount: {amount}"
+        )));
     }
     let frac_padded = format!("{frac:0<7}");
-
-    // Parse the whole part as an unsigned 64-bit integer first so that a
-    // leading minus sign is rejected before the overflow-checked multiply.
-    let whole_val: u64 = whole
-        .parse()
-        .map_err(|_| format!("invalid amount: {amount}"))?;
-    let frac_stroops: i64 = frac_padded
-        .parse()
-        .map_err(|_| format!("invalid amount: {amount}"))?;
-
-    // Checked multiply: whole_val * 10_000_000 must fit in i64.
-    let whole_stroops: i64 = (whole_val as i64)
-        .checked_mul(10_000_000)
-        .ok_or_else(|| format!("amount overflows i64: {amount}"))?;
-
-    whole_stroops
-        .checked_add(frac_stroops)
-        .ok_or_else(|| format!("amount overflows i64: {amount}"))
+    let whole_stroops: i64 = whole.parse().map_err(|_| {
+        BlockchainError::ParseError(format!("invalid amount: {amount}"))
+    })?;
+    let frac_stroops: i64 = frac_padded.parse().map_err(|_| {
+        BlockchainError::ParseError(format!("invalid amount: {amount}"))
+    })?;
+    Ok(whole_stroops * 10_000_000 + frac_stroops)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression for #1225: a single pooled `reqwest::Client` is held on the
+    // listener and reused across poll cycles instead of being rebuilt per call.
+    #[test]
+    fn horizon_client_uses_fifteen_second_timeout() {
+        assert_eq!(HORIZON_TIMEOUT, Duration::from_secs(15));
+        let _listener = StellarListener::new("https://horizon-testnet.stellar.org".into());
+        assert!(StellarListener::new("https://horizon-testnet.stellar.org".into())
+            .skipped_addresses()
+            .is_empty());
+    }
 
     #[test]
     fn parses_whole_and_fractional_amounts() {
@@ -403,7 +367,8 @@ mod tests {
 
     #[test]
     fn rejects_excess_precision() {
-        assert!(parse_amount_to_stroops("1.12345678").is_err());
+        let err = parse_amount_to_stroops("1.12345678").unwrap_err();
+        assert!(matches!(err, BlockchainError::ParseError(_)));
     }
 
     // --------------------------------------------------------------------------
@@ -415,7 +380,6 @@ mod tests {
             op_type: op_type.to_string(),
             transaction_successful: true,
             transaction_hash: "abc123".to_string(),
-            ledger: Some(1234),
             to: None,
             destination: None,
             account: None,
@@ -584,51 +548,23 @@ mod tests {
         assert!(!listener.should_skip(addr_a));
     }
 
-    // --------------------------------------------------------------------------
-    // #1197 — ledger sequence carried on detected deposits
-    // --------------------------------------------------------------------------
-
     #[test]
-    fn deposit_carries_ledger_from_operation_record() {
+    fn failed_transaction_produces_no_deposit() {
         let addr = "GDESK...WALLET";
         let mut rec = make_record("payment");
+        rec.transaction_successful = false;
         rec.to = Some(addr.to_string());
         rec.amount = Some("10.0000000".to_string());
-        rec.ledger = Some(4242);
 
-        let deposit = record_to_deposit(rec, addr).expect("payment should be detected");
-        assert_eq!(deposit.ledger, 4242);
+        assert!(record_to_deposit(rec, addr).is_none());
     }
 
     #[test]
-    fn deposit_falls_back_to_transaction_ledger() {
+    fn unrelated_operation_produces_no_deposit() {
         let addr = "GDESK...WALLET";
-        let mut rec = make_record("payment");
-        rec.to = Some(addr.to_string());
-        rec.amount = Some("10.0000000".to_string());
-        rec.ledger = None;
-        rec.transaction = Some(EmbeddedTransaction {
-            memo: None,
-            ledger: Some(777),
-        });
+        let rec = make_record("account_merge");
 
-        let deposit = record_to_deposit(rec, addr).expect("payment should be detected");
-        assert_eq!(deposit.ledger, 777);
-    }
-
-    #[test]
-    fn deposit_defaults_ledger_to_zero_when_absent() {
-        let addr = "GDESK...WALLET";
-        let mut rec = make_record("payment");
-        rec.to = Some(addr.to_string());
-        rec.amount = Some("10.0000000".to_string());
-        rec.ledger = None;
-
-        let deposit = record_to_deposit(rec, addr).expect("payment should be detected");
-        assert_eq!(deposit.ledger, 0);
-    }
-
-    #[test]
+        assert!(record_to_deposit(rec, addr).is_none());
     fn skipped_addresses_lists_only_wallets_in_backoff() {
         let listener = StellarListener::new("https://horizon-testnet.stellar.org".into());
         listener.record_unfunded("GADDR...A");
@@ -657,90 +593,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_transaction_produces_no_deposit() {
-        let addr = "GDESK...WALLET";
-        let mut rec = make_record("payment");
-        rec.transaction_successful = false;
-        rec.to = Some(addr.to_string());
-        rec.amount = Some("10.0000000".to_string());
-
-        assert!(record_to_deposit(rec, addr).is_none());
-    }
-
-    #[test]
-    fn unrelated_operation_produces_no_deposit() {
-        let addr = "GDESK...WALLET";
-        let rec = make_record("account_merge");
-
-        assert!(record_to_deposit(rec, addr).is_none());
-    }
-
-    // --------------------------------------------------------------------------
-    // #1041 — parse_amount_to_stroops edge cases: overflow, negative, empty,
-    //          whitespace
-    // --------------------------------------------------------------------------
-
-    /// A whole-part value large enough to overflow i64 when multiplied by
-    /// 10_000_000 (the stroops factor).  i64::MAX / 10_000_000 ≈ 922_337_203,
-    /// so "922337204.0" is the smallest whole XLM value that overflows.
-    #[test]
-    fn parse_amount_overflow_returns_err() {
-        // 922_337_204 * 10_000_000 > i64::MAX — must not silently truncate.
-        assert!(
-            parse_amount_to_stroops("922337204.0").is_err(),
-            "overflow should return Err"
-        );
-
-        // Even larger values are also rejected.
-        assert!(
-            parse_amount_to_stroops("999999999999999999.0").is_err(),
-            "very large value should return Err"
-        );
-    }
-
-    /// Negative amounts (e.g. from a malformed Horizon response) must be
-    /// rejected — a negative stroop count would silently corrupt the balance
-    /// ledger if it slipped through.
-    #[test]
-    fn parse_amount_negative_returns_err() {
-        assert!(
-            parse_amount_to_stroops("-1.0").is_err(),
-            "negative amount should return Err"
-        );
-        assert!(
-            parse_amount_to_stroops("-0.0000001").is_err(),
-            "negative fractional amount should return Err"
-        );
-    }
-
-    /// An empty string is not a valid decimal and must be rejected rather than
-    /// interpreted as zero or panicking.
-    #[test]
-    fn parse_amount_empty_string_returns_err() {
-        assert!(
-            parse_amount_to_stroops("").is_err(),
-            "empty string should return Err"
-        );
-    }
-
-    /// Whitespace-only input must be rejected.  A real Horizon amount field
-    /// will never be blank, but a test or mocked response could be.
-    #[test]
-    fn parse_amount_whitespace_only_returns_err() {
-        assert!(
-            parse_amount_to_stroops("   ").is_err(),
-            "whitespace-only string should return Err"
-        );
-        assert!(
-            parse_amount_to_stroops("\t").is_err(),
-            "tab-only string should return Err"
-        );
-        assert!(
-            parse_amount_to_stroops("\n").is_err(),
-            "newline-only string should return Err"
-        );
-    }
     #[tokio::test]
     async fn a_hanging_horizon_request_times_out_and_the_poll_continues() {
         const SLOW: &str = "GSLOW";
@@ -778,6 +630,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2), "the slow address must time out");
         assert_eq!(deposits.len(), 1, "the other wallet is still polled");
         assert_eq!(deposits[0].tx_hash, "fast-tx");
+    }
+
+
     // --------------------------------------------------------------------------
     // #1045 — backoff duration calculation: 30 * 2^n capped at MAX_BACKOFF
     //

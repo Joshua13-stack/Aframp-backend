@@ -4,6 +4,7 @@ Everything documented here is implemented and covered by integration tests again
 
 - **Base URL (dev):** `http://127.0.0.1:3000`
 - **Content type:** `application/json` on every request with a body
+- **Request body limit:** 64KB (65,536 bytes) by default, configurable server-side via `MAX_REQUEST_BODY_BYTES`. Larger bodies are rejected with `413 Payload Too Large` before reaching any handler. Every current endpoint needs well under 1KB.
 - **Machine-readable spec:** [`openapi.yaml`](openapi.yaml) — generate a typed client from it rather than hand-writing calls
 
 ---
@@ -43,7 +44,7 @@ Two things worth building for up front:
 
 ### CORS
 
-Browser origins must be allowlisted server-side via the `CORS_ALLOWED_ORIGINS` env var (comma-separated, defaults to `http://localhost:3001`). Allowed methods are `GET`/`POST`; allowed headers are `Authorization` and `Content-Type`. Credentials **are** enabled, so the origin list is never mirrored back — an origin that isn't listed fails preflight.
+Browser origins must be allowlisted server-side via the `CORS_ALLOWED_ORIGINS` env var (comma-separated, defaults to `http://localhost:3001`). Allowed methods are `GET`, `POST`, `PUT`, `PATCH` and `DELETE` (`PATCH`/`DELETE` are listed proactively so new endpoints don't fail preflight — see #1249); allowed headers are `Authorization` and `Content-Type`. Credentials **are** enabled, so the origin list is never mirrored back — an origin that isn't listed fails preflight.
 
 The supported deployment is **same-origin**: serve the frontend and this API behind one hostname (the reverse proxy routes `/api/*` here) and CORS stops applying at all. Cross-origin cookie auth additionally needs `COOKIE_SAME_SITE=none`, which lets the session ride cross-site requests and reintroduces CSRF as something you have to handle. With the default `SameSite=Lax`, a cross-origin frontend won't get the cookie sent at all and has to fall back to the bearer header.
 
@@ -121,23 +122,38 @@ sequenceDiagram
 
 ### Rate limits at a glance
 
-| Action | Limit | Error |
-|---|---|---|
-| OTP send per phone | 1 per 60 seconds | `429 TOO_MANY_REQUESTS` |
-| OTP send per phone | 5 per hour | `429 TOO_MANY_REQUESTS` |
-| Wrong OTP guesses | 5 per challenge | `400 OTP_LOCKED` (challenge dead) |
-| Code validity window | 10 minutes | `400 OTP_EXPIRED` |
+| Action | Limit | Error | Header |
+|---|---|---|---|
+| OTP send per phone | 1 per 60 seconds | `429 TOO_MANY_REQUESTS` | `Retry-After: <secs>` (how long to wait, ≤ 60) |
+| OTP send per phone | 5 per hour | `429 TOO_MANY_REQUESTS` | `Retry-After: <secs>` |
+| Wrong OTP guesses | 5 per challenge | `400 OTP_LOCKED` (challenge dead) | — |
+| Code validity window | 10 minutes | `400 OTP_EXPIRED` | — |
 
-There is currently **no rate limit on the password check itself** — repeated wrong-password attempts against `/login` are not throttled before the OTP step.
+When a `429` response is returned, the `Retry-After` header value is the number
+of **whole seconds** the client should wait before retrying. Always read this
+header; do not hard-code a back-off duration on the client side.
+
+```js
+if (res.status === 429) {
+    const retryAfter = parseInt(res.headers.get('Retry-After') ?? '60', 10);
+    scheduleRetry(retryAfter * 1000); // back off for exactly this long
+}
+```
 
 ---
 
 ## Errors
 
-Every error returns the same shape — a human-readable `error` string plus a stable, machine-readable `code` you can branch on:
+Every error returns a human-readable `error` string and a stable, machine-readable `code`:
 
 ```json
 { "error": "insufficient available balance", "code": "INSUFFICIENT_BALANCE" }
+```
+
+Field-level validation errors also include the offending `field`; all other errors omit it:
+
+```json
+{ "error": "must be a valid email address", "code": "INVALID_PARAMETERS", "field": "email" }
 ```
 
 `code` is stable and never changes wording; `error` is written for humans. Match on `code`, never on the `error` string.
@@ -145,12 +161,15 @@ Every error returns the same shape — a human-readable `error` string plus a st
 | Status | Meaning | Frontend handling |
 |---|---|---|
 | `400` | Validation failed, or the account has no merchant | Show the `error` string; it's written for humans |
+| `413` | Request body exceeds the configured body-size limit (`PAYLOAD_TOO_LARGE`) | Reduce the request body |
 | `415` | `Content-Type` isn't `application/json` on a POST/PUT with a body | Send `Content-Type: application/json` and retry |
 | `401` | Missing, malformed, or expired token | Redirect to login |
 | `404` | Resource not found | — |
 | `409` | Email or phone already registered | Show on the signup form |
+| `403` | Authenticated but not an admin, or the merchant account is suspended | Show an authorization error; contact support if the account is suspended |
+| `429` | OTP resend cooldown/hourly cap, or login attempt limit | Wait for the cooldown; don't auto-retry |
 | `403` | Authenticated, but not an admin (`/admin/*` only) | Not applicable to merchant-facing routes |
-| `429` | OTP resent too soon, or too many times this hour | Show the wait; don't auto-retry |
+| `429` | OTP resent too soon, or too many times this hour | Read `Retry-After` header (seconds); show the wait; don't auto-retry |
 | `502` | Upstream payment provider failed (`PAYOUT_FAILED`) | **Do not retry the same withdrawal.** The withdrawal row is already created (then marked `failed` and the balance refunded). Show the `error` string; let the user start a *new* withdrawal if they want to try again. |
 | `500` | Internal error | Generic `INTERNAL_ERROR`; details stay in server logs |
 
@@ -160,48 +179,29 @@ Every `ErrorCode` variant defined in `src/error.rs` is listed below, with the HT
 
 | Code | HTTP Status | Description | Endpoints that can return it |
 |---|---|---|---|
-| `INVALID_PARAMETERS` | `400` | A required field is missing or malformed (short password, empty name/email, unparseable phone, bad `bank_code`/`account_number`, malformed body) | `POST /signup`, `POST /login`, `POST /verify-otp`, `POST /wallet/create`, `POST /payment-requests`, `POST /withdraw` |
+| `INVALID_PARAMETERS` | `400` | A required field is missing or malformed (short password, empty name/email, unparseable phone, bad `bank_code`/`account_number`, malformed body) | `POST /signup`, `POST /login`, `POST /verify-otp`, `PATCH /me`, `POST /wallet/create`, `POST /payment-requests`, `POST /withdraw` |
 | `INVALID_AMOUNT` | `400` | Amount is not positive, or not a whole number of kobo (`amount_stroops` not a multiple of `100000`) | `POST /payment-requests`, `POST /withdraw` |
 | `INSUFFICIENT_BALANCE` | `400` | Withdrawal exceeds the merchant's available balance | `POST /withdraw` |
-| `UNSUPPORTED_ASSET` | `400` | Withdrawal `asset` isn't `cNGN` | `POST /withdraw` |
+| `UNSUPPORTED_ASSET` | `400` | Asset isn't supported by the operation | `POST /payment-requests`, `POST /withdraw` |
 | `PAYOUT_FAILED` | `502` | Upstream payment provider (Paystack) rejected the payout; the balance is refunded and the withdrawal is recorded as `failed` | `POST /withdraw` |
 | `EMAIL_TAKEN` | `409` | Signup email already registered to a verified account | `POST /signup` |
 | `PHONE_TAKEN` | `409` | Signup phone already registered to a verified account | `POST /signup` |
 | `INVALID_CREDENTIALS` | `401` | Wrong password or unknown email on login; also any missing, malformed, or expired token on an authenticated route | `POST /login`, every auth-required endpoint |
-| `USER_NOT_FOUND` | `404` | Authenticated user no longer exists | Any auth-required endpoint (`GET /me`, `POST /wallet/create`, `GET /wallet`, `POST /payment-requests`, `GET /payment-requests`, `GET /balance`, `GET /transactions`, `POST /withdraw`, `GET /withdrawals`) |
-| `MERCHANT_NOT_FOUND` | `400` | Account has no merchant — send the user through onboarding | Any merchant-scoped endpoint (`GET /me`, `POST /wallet/create`, `GET /wallet`, `POST /payment-requests`, `GET /payment-requests`, `GET /balance`, `GET /transactions`, `POST /withdraw`, `GET /withdrawals`) |
-| `WALLET_NOT_FOUND` | `400` | No wallet yet, or none created before a payment-request call | `GET /wallet`, `POST /payment-requests` |
-| `PAYMENT_REQUEST_NOT_FOUND` | `404` | Payment request id doesn't exist | `GET /payment-requests/{id}` |
-| `FORBIDDEN` | `403` | Authenticated but not an admin, on an `/admin/*` route | `/admin/*` routes |
+| `USER_NOT_FOUND` | `404` | Authenticated user no longer exists | `GET /me` |
+| `MERCHANT_NOT_FOUND` | `400` | Account has no merchant — send the user through onboarding | Merchant-scoped endpoints (`POST /wallet/create`, `GET /wallet`, `POST /payment-requests`, `GET /payment-requests`, `GET /balance`, `GET /transactions`, `POST /withdraw`, `GET /withdrawals`) |
+| `WALLET_NOT_FOUND` | `404` | No wallet yet, or none created before a payment-request call | `GET /wallet`, `POST /payment-requests` |
+| `PAYMENT_REQUEST_NOT_FOUND` | `404` | Payment request id doesn't exist or is not visible to this merchant | `GET /payment-requests/{id}`, `GET /payment-requests/{id}/status`, `DELETE /payment-requests/{id}` |
+| `FORBIDDEN` | `403` | Authenticated but not an admin, or the merchant account is suspended | `/admin/*`, `POST /payment-requests`, `POST /withdraw` |
 | `OTP_INVALID` | `400` | Wrong code submitted to `/verify-otp` | `POST /verify-otp` |
 | `OTP_EXPIRED` | `400` | Code submitted after its 10-minute window | `POST /verify-otp` |
 | `OTP_CHALLENGE_NOT_FOUND` | `404` | Unknown or already-consumed `challenge_id` | `POST /verify-otp` |
 | `OTP_LOCKED` | `400` | 5 wrong attempts on this challenge — request a new one via `/signup` or `/login` | `POST /verify-otp` |
-| `TOO_MANY_REQUESTS` | `429` | OTP resent inside the 60s cooldown, or 5th+ send this hour | `POST /signup`, `POST /login` |
+| `TOO_MANY_REQUESTS` | `429` | OTP resend/verification cooldown or login attempt limit | `POST /signup`, `POST /login`, `POST /verify-otp`, `PATCH /me` |
+| `PAYLOAD_TOO_LARGE` | `413` | Request body exceeds the configured size limit | Any endpoint receiving a request body |
+| `TOO_MANY_REQUESTS` | `429` | OTP resent inside the 60s cooldown, or 5th+ send this hour. The response includes a `Retry-After` header (integer seconds) indicating how long to wait before retrying. | `POST /signup`, `POST /login` |
 | `INTERNAL_ERROR` | `500` | Unexpected server error; generic message only | Any endpoint |
 
 > **`INTERNAL_ERROR` is always a `500`.** The response body carries the fixed, safe message `"internal server error"` — never a stack trace, SQL error, or any other internal detail. Those are written to the server logs only. Treat a `500` as "something broke on our side, retry or report it," and never try to parse the `error` string for a cause.
-| Code | Status | When it's returned |
-|---|---|---|
-| `INVALID_PARAMETERS` | `400` | A required field is missing/malformed (e.g. short password, bad account_number/bank_code) |
-| `INVALID_AMOUNT` | `400` | Amount is not positive, or not a whole number of kobo |
-| `INSUFFICIENT_BALANCE` | `400` | Withdrawal exceeds the available balance |
-| `UNSUPPORTED_ASSET` | `400` | Withdrawal asset isn't cNGN |
-| `EMAIL_TAKEN` | `409` | Signup email already registered (to a verified account) |
-| `PHONE_TAKEN` | `409` | Signup phone already registered (to a verified account) |
-| `INVALID_CREDENTIALS` | `401` | Wrong password or unknown email on login |
-| `USER_NOT_FOUND` | `404` | Authenticated user no longer exists |
-| `MERCHANT_NOT_FOUND` | `400` | Account has no merchant (visit onboarding) |
-| `WALLET_NOT_FOUND` | `404` | No wallet yet, or none created before a payment-request call |
-| `PAYMENT_REQUEST_NOT_FOUND` | `404` | Payment request id doesn't exist |
-| `PAYOUT_FAILED` | `502` | Upstream payment provider rejected the payout. The withdrawal audit row already exists (`status: failed`); balance was refunded. **Do not auto-retry** — retrying creates a duplicate attempt. |
-| `FORBIDDEN` | `403` | Authenticated but not an admin, on an `/admin/*` route |
-| `OTP_INVALID` | `400` | Wrong code submitted to `/verify-otp` |
-| `OTP_EXPIRED` | `400` | Code submitted after its 10-minute window |
-| `OTP_LOCKED` | `400` | 5 wrong attempts on this challenge — request a new one |
-| `OTP_CHALLENGE_NOT_FOUND` | `404` | Unknown or already-consumed `challenge_id` |
-| `TOO_MANY_REQUESTS` | `429` | OTP resent inside the 60s cooldown, or 5th+ send this hour |
-| `INTERNAL_ERROR` | `500` | Unexpected server error; generic message only |
 
 ---
 
@@ -232,6 +232,44 @@ Never use floating-point arithmetic to accumulate balances — convert for displ
 
 ---
 
+## Amounts and Denominations
+
+All monetary values in this API are integers denominated in **stroops** — the
+smallest unit of Stellar assets. Never send whole units.
+
+- `1 XLM = 10,000,000 stroops`
+- `1 cNGN = 10,000,000 stroops`
+- `1 cNGN stroop = 100,000 kobo` (i.e. `1 cNGN` = `100 kobo`)
+
+Conversion formula:
+
+```
+amount_stroops = whole_units × 10,000,000
+```
+
+| Whole units | `amount_stroops` |
+|---|---|
+| 0.0000001 XLM | 1 (minimum) |
+| 1 XLM / 1 cNGN | 10,000,000 |
+| 2.5 XLM | 25,000,000 |
+| 50 cNGN | 500,000,000 |
+| 2,500 cNGN (₦2,500) | 25,000,000,000 |
+
+Example: `₦2,500 = 25,000,000,000 cNGN stroops`.
+
+> **Warning:** the most common integration mistake is sending amounts in whole
+> units (e.g. `25`) instead of stroops (`250,000,000`). That creates a payment
+> for `0.0000025` units. Always multiply by `10,000,000` before sending, and
+> never use floating-point arithmetic to accumulate balances — convert for
+> display only.
+
+```js
+const toDisplay = (stroops) => (stroops / 10_000_000).toFixed(7);
+const toStroops = (amount) => Math.round(amount * 10_000_000);
+```
+
+---
+
 ## Pagination
 
 `GET /transactions`, `GET /payment-requests` and `GET /withdrawals` return
@@ -244,14 +282,32 @@ you page never shift or repeat later pages. A malformed cursor returns `400`.
 ## Endpoints
 
 ### `GET /health`
+#### Error Responses
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Liveness probe. No auth. Returns `200` with `{"status": "ok", "version": "<crate version>"}`.
 
 ### `GET /`
+#### Error Responses
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Returns the literal string `aframp` (not JSON). Useful as a smoke test.
 
 ---
 
 ### `POST /signup`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "must be a valid email address", "code": "INVALID_PARAMETERS", "field": "email" }` (the `field` may be `email`, `password`, `name`, or `phone_number`)
+- `409 Conflict` (`EMAIL_TAKEN`): `{ "error": "email already registered", "code": "EMAIL_TAKEN" }`
+- `409 Conflict` (`PHONE_TAKEN`): `{ "error": "phone number already registered", "code": "PHONE_TAKEN" }`
+- `413 Payload Too Large` (`PAYLOAD_TOO_LARGE`): `{ "error": "request body too large", "code": "PAYLOAD_TOO_LARGE" }`
+- `415 Unsupported Media Type` (`INVALID_PARAMETERS`): `{ "error": "content-type must be application/json", "code": "INVALID_PARAMETERS" }`
+- `429 Too Many Requests` (`TOO_MANY_REQUESTS`): `{ "error": "too many requests, please try again shortly", "code": "TOO_MANY_REQUESTS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 No auth. **Does not create the account.** Validates the credentials, sends an OTP to `phone_number`, and returns a challenge — the user + merchant only get inserted once `POST /verify-otp` succeeds with the right code. This means the same email can be re-submitted freely (it's the resend path) as long as no prior attempt for it was ever verified.
 
 ```json
@@ -275,6 +331,15 @@ No auth. **Does not create the account.** Validates the credentials, sends an OT
 Errors: `400` if email is empty/invalid/oversized, password is under 8 characters, name is empty or longer than 100 characters, or the phone doesn't parse. `409` (`EMAIL_TAKEN`/`PHONE_TAKEN`) if either is already registered to a *verified* account. `429` (`TOO_MANY_REQUESTS`) if resent within 60s of the last send, or 5 times inside an hour.
 
 ### `POST /login`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "must be a valid email address", "code": "INVALID_PARAMETERS", "field": "email" }` (the `field` may be `email` or `password`)
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid email or password", "code": "INVALID_CREDENTIALS" }`
+- `413 Payload Too Large` (`PAYLOAD_TOO_LARGE`): `{ "error": "request body too large", "code": "PAYLOAD_TOO_LARGE" }`
+- `415 Unsupported Media Type` (`INVALID_PARAMETERS`): `{ "error": "content-type must be application/json", "code": "INVALID_PARAMETERS" }`
+- `429 Too Many Requests` (`TOO_MANY_REQUESTS`): `{ "error": "too many login attempts, try again later", "code": "TOO_MANY_REQUESTS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 No auth. Verifies the password. If the account has a verified phone number, this returns a **fresh OTP challenge** (identical shape to `/signup`'s) instead of a session — full two-factor, every login, no exception for a returning session. Only an account with no phone on file (impossible to create anymore; a relic of accounts made before this existed) logs in synchronously with the old one-step response.
 
 ```json
@@ -288,6 +353,19 @@ Errors: `401` for both a wrong password and an unknown email — deliberately in
 **Rate limited.** `POST /login` is throttled per email: **max 10 attempts per 15 minutes**. Every request counts toward the window, whether the password is right or wrong. When the limit is exceeded the endpoint returns `429 Too Many Requests` with a `Retry-After` header (seconds until the oldest attempt leaves the window) and `{"error":"too many login attempts, try again later","code":"TOO_MANY_REQUESTS"}`. Back off for the number of seconds in `Retry-After`; don't auto-retry, and don't treat it as a bad password.
 
 ### `POST /verify-otp`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "invalid request", "code": "INVALID_PARAMETERS", "field": "code" }`
+- `400 Bad Request` (`OTP_INVALID`): `{ "error": "incorrect code", "code": "OTP_INVALID" }`
+- `400 Bad Request` (`OTP_EXPIRED`): `{ "error": "otp code has expired", "code": "OTP_EXPIRED" }`
+- `400 Bad Request` (`OTP_LOCKED`): `{ "error": "too many incorrect attempts", "code": "OTP_LOCKED" }`
+- `404 Not Found` (`OTP_CHALLENGE_NOT_FOUND`): `{ "error": "otp challenge not found or already used", "code": "OTP_CHALLENGE_NOT_FOUND" }`
+- `409 Conflict` (`EMAIL_TAKEN` or `PHONE_TAKEN`): `{ "error": "email already registered", "code": "EMAIL_TAKEN" }` (or `PHONE_TAKEN`)
+- `413 Payload Too Large` (`PAYLOAD_TOO_LARGE`): `{ "error": "request body too large", "code": "PAYLOAD_TOO_LARGE" }`
+- `415 Unsupported Media Type` (`INVALID_PARAMETERS`): `{ "error": "content-type must be application/json", "code": "INVALID_PARAMETERS" }`
+- `429 Too Many Requests` (`TOO_MANY_REQUESTS`): `{ "error": "too many requests, please try again shortly", "code": "TOO_MANY_REQUESTS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 No auth. The **only** endpoint that ever issues a session, reached from either a signup or a login challenge.
 
 ```json
@@ -307,14 +385,57 @@ No auth. The **only** endpoint that ever issues a session, reached from either a
 Errors: `400` `OTP_INVALID` (wrong code — 5 wrong guesses and the challenge is dead, not just that attempt), `OTP_EXPIRED` (codes last 10 minutes), `OTP_LOCKED` (attempts exhausted — restart via `/signup` or `/login` for a new one). `404` `OTP_CHALLENGE_NOT_FOUND` for an unknown or already-consumed `challenge_id`.
 
 ### `POST /auth/refresh`
+#### Error Responses
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required (bearer or session cookie; the token must not have expired). Returns a new token with the same body shape as `/verify-otp` and resets the session cookie. The new token expires 24h from now, but never more than 7 days after the original login; past that point this returns `401` ("session can no longer be refreshed; log in again"). Refresh doesn't revoke the old token — it stays valid until its own `exp`.
 
+### `POST /auth/change-password`
+Auth required (bearer or session cookie).
+
+```json
+{ "current_password": "old-password", "new_password": "new-password-123" }
+```
+
+Re-proves the current password, then replaces it. `200` → a fresh session with the same body shape as `/verify-otp`, also set as the session cookie, so the device that made the change stays signed in. **Every other session for the account stops working immediately** — including ones that were refreshed via `/auth/refresh`, since refreshes keep the original login time.
+
+Errors: `400` with `field: "new_password"` if it's shorter than 8 characters; `400` with `field: "current_password"` if the current password is wrong (deliberately not `401`, which clients treat as "session expired"); `401` for a missing, expired or already-revoked session.
+### `GET /verify-email`
+No auth. Consumes the single-use, 24-hour token from the verification email
+sent when a signup completes or a resend is requested.
+
+```
+GET /verify-email?token=<hex-token>
+```
+
+`200` → `{ "email_verified": true }`. Unknown, already-used, or expired tokens
+return `400` `INVALID_PARAMETERS` ("invalid or expired email verification
+token"), and an empty `token` returns `400` with `field: "token"`.
+
+### `POST /verify-email/resend`
+Auth required. Issues a fresh verification link for the signed-in account,
+invalidating any previous token. Returns `200` `{ "sent": true }`. Because no
+transactional email provider is wired into the backend yet, the link is emitted
+through structured logs (`verification_link`).
+
 ### `POST /logout`
+#### Error Responses
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 No auth — a browser holding an expired or malformed session still needs to clear it. Returns `204` and a `Set-Cookie` that expires `aframp_session` immediately.
 
 Note this clears the browser's session, it does not revoke the JWT: a token already copied elsewhere stays valid until it expires. There's no server-side revocation list yet.
 
 ### `GET /me`
+#### Error Responses
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "missing session cookie or bearer token", "code": "INVALID_CREDENTIALS" }`
+- `404 Not Found` (`USER_NOT_FOUND`): `{ "error": "user not found", "code": "USER_NOT_FOUND" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. The signed-in user's profile. The JWT carries only ids, so call this after a reload to render anything human-readable without forcing a re-login.
 
 `200` →
@@ -336,7 +457,37 @@ Auth required. The signed-in user's profile. The JWT carries only ids, so call t
 
 ---
 
+### `GET /merchants/me`
+Auth required. The signed-in user's merchant profile on its own, separate from `GET /me`. Returns the full `Merchant` model so richer business data (address, logo, bank account, verification status) can grow here without bloating the auth-identity endpoint.
+
+`200` →
+```json
+{
+  "id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
+  "user_id": "2c5e0ee2-7f87-4efb-b1c9-d7e1b3ee0eeb",
+  "name": "Shop Name",
+  "email": "merchant@example.com",
+  "email_notifications_enabled": true,
+  "unsubscribe_token": null,
+  "suspended_at": null,
+  "created_at": "2026-08-13T14:15:34.232320Z",
+  "updated_at": "2026-08-13T14:15:34.232320Z"
+}
+```
+`404` with `MERCHANT_NOT_FOUND` when the account has no merchant profile. `email`, `unsubscribe_token` and `suspended_at` are `null` when unset.
+
+---
+
 ### `PATCH /me`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "provide name and/or phone_number", "code": "INVALID_PARAMETERS" }`; field validation uses `{ "error": "...", "code": "INVALID_PARAMETERS", "field": "name" }` (or `phone_number`)
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `409 Conflict` (`PHONE_TAKEN`): `{ "error": "phone number already registered", "code": "PHONE_TAKEN" }`
+- `413 Payload Too Large` (`PAYLOAD_TOO_LARGE`): `{ "error": "request body too large", "code": "PAYLOAD_TOO_LARGE" }`
+- `429 Too Many Requests` (`TOO_MANY_REQUESTS`): `{ "error": "too many requests, please try again shortly", "code": "TOO_MANY_REQUESTS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. Body: `{ "name"?: string, "phone_number"?: string }` (at least one). A new `name` (trimmed, 1–100 characters) applies immediately. A new `phone_number` (any common Nigerian format, normalized to `+234…`) is **not** switched yet: an OTP is sent to it and the response includes `phone_verification: { challenge_id, expires_in_secs }`. Complete it with `POST /verify-otp` (as at signup) to move the account to the new number.
 
 `200` → `{ "name": "...", "phone_number": "<number on file>", "phone_verification": null | {...} }`. `400` with `field` for invalid input, `409` if the number belongs to another account, `429` if OTP sends to that number are rate limited.
@@ -353,11 +504,24 @@ Auth required (merchant account). Body: `{ "name"?: string, "email"?: string }` 
 Auth required. Body: `{ "token": string }`. Moves `pending_email` into `email`. `200` → same shape as `PATCH /merchants/me`; `400 OTP_INVALID` if the token is wrong or expired, or no change is pending.
 
 ### `DELETE /me`
+#### Error Responses
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. Deletes the signed-in account (right to erasure under GDPR / NDPA). Returns `204` and clears the session cookie. Every token issued for the account stops working immediately (including for `/auth/refresh`), and the email can't log in again.
 
 **Data retention:** deletion is a soft delete. Personal data on the account is erased in place — email becomes `deleted-<id>@deleted.invalid`, name becomes "Deleted user", the phone number and password hash are cleared — and pending OTP challenges are removed. Financial records (payments, payment requests, withdrawals, wallets, balances) are kept, still linked to the anonymized account, because they're needed for the audit trail; withdrawal records keep the bank details they were paid out to for the same reason.
 
 ### `POST /wallet/create`
+#### Error Responses
+- `400 Bad Request` (`MERCHANT_NOT_FOUND`): `{ "error": "no merchant associated with this account", "code": "MERCHANT_NOT_FOUND" }`
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `413 Payload Too Large` (`PAYLOAD_TOO_LARGE`): `{ "error": "request body too large", "code": "PAYLOAD_TOO_LARGE" }`
+- `415 Unsupported Media Type` (`INVALID_PARAMETERS`): `{ "error": "content-type must be application/json", "code": "INVALID_PARAMETERS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. Generates a **real Stellar ed25519 keypair** for the merchant. The private key is AES-256-GCM encrypted server-side and never leaves it.
 
 ```json
@@ -379,13 +543,33 @@ Auth required. Generates a **real Stellar ed25519 keypair** for the merchant. Th
 > **Calling this repeatedly creates a new wallet each time.** There's no idempotency guard. `GET /wallet` returns the most recently created one, so a duplicate call silently changes where new payment requests point. Create a wallet once during onboarding and check `GET /wallet` first.
 
 ### `GET /wallet`
+#### Error Responses
+- `400 Bad Request` (`MERCHANT_NOT_FOUND`): `{ "error": "no merchant associated with this account", "code": "MERCHANT_NOT_FOUND" }`
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `404 Not Found` (`WALLET_NOT_FOUND`): `{ "error": "no wallet created yet", "code": "WALLET_NOT_FOUND" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. The merchant's most recent wallet. Same shape as above.
 
-Errors: `404 "no wallet created yet"` if none exists — that's the signal to run onboarding, not an error to surface raw.
+`404 WALLET_NOT_FOUND` if none exists — that's the signal to run onboarding, not an error to surface raw.
 
 ---
 
 ### `POST /payment-requests`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "amount_stroops must be a positive integer", "code": "INVALID_PARAMETERS", "field": "amount_stroops" }`
+- `400 Bad Request` (`INVALID_AMOUNT`): `{ "error": "amount_stroops must be positive", "code": "INVALID_AMOUNT" }`
+- `400 Bad Request` (`UNSUPPORTED_ASSET`): `{ "error": "unsupported asset", "code": "UNSUPPORTED_ASSET" }`
+- `400 Bad Request` (`MERCHANT_NOT_FOUND`): `{ "error": "no merchant associated with this account", "code": "MERCHANT_NOT_FOUND" }`
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `403 Forbidden` (`FORBIDDEN`): `{ "error": "this merchant account has been suspended", "code": "FORBIDDEN" }`
+- `404 Not Found` (`WALLET_NOT_FOUND`): `{ "error": "create a wallet before generating payment requests", "code": "WALLET_NOT_FOUND" }`
+- `413 Payload Too Large` (`PAYLOAD_TOO_LARGE`): `{ "error": "request body too large", "code": "PAYLOAD_TOO_LARGE" }`
+- `415 Unsupported Media Type` (`INVALID_PARAMETERS`): `{ "error": "content-type must be application/json", "code": "INVALID_PARAMETERS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. **The core POS action.** Creates a request for a specific amount and returns a scannable payload.
 
 ```json
@@ -396,7 +580,7 @@ Auth required. **The core POS action.** Creates a request for a specific amount 
 |---|---|---|---|
 | `amount_stroops` | yes | — | Must be a positive **integer** (`int64`). Floats (`2.5`) and strings (`"100"`) are rejected with `400` `{ code: "INVALID_PARAMETERS", field: "amount_stroops" }` — not a bare 422. |
 | `asset` | no | `"XLM"` | See the cNGN caveat below |
-| `expires_in_secs` | no | `900` (15 min) | Integer `int64`, clamped to 60–86400 |
+| `expires_in_secs` | no | `900` (15 min) | Integer `int64`, must be between **60 and 86400** (inclusive). Values outside this range are rejected with `400 INVALID_PARAMETERS` — they are **not** silently clamped. A value of `59` or `86401` will fail rather than produce a surprising expiry. |
 
 `200` →
 ```json
@@ -421,10 +605,16 @@ Auth required. **The core POS action.** Creates a request for a specific amount 
 
 **The `memo` is what links a payment to this request.** A customer paying without it still credits the merchant's balance, but the request stays `pending` forever. The SEP-7 URI includes it automatically; if you ever show manual payment instructions, the memo is mandatory.
 
-Errors: `404 "create a wallet before generating payment requests"` if the merchant has no wallet.
-Errors: `400 "create a wallet before generating payment requests"` if the merchant has no wallet. Non-integer `amount_stroops` → `400` with `code: "INVALID_PARAMETERS"` and `field: "amount_stroops"`.
+Non-integer `amount_stroops` returns `400` with `code: "INVALID_PARAMETERS"` and `field: "amount_stroops"`. A missing wallet returns `404 WALLET_NOT_FOUND`.
 
 ### `GET /payment-requests`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "invalid cursor", "code": "INVALID_PARAMETERS" }`
+- `400 Bad Request` (`MERCHANT_NOT_FOUND`): `{ "error": "no merchant associated with this account", "code": "MERCHANT_NOT_FOUND" }`
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. The merchant's own requests, **newest first**. Scoped to the authenticated merchant — you cannot see another merchant's requests.
 
 Query:
@@ -437,6 +627,14 @@ Query:
 Cancelled requests are omitted from the default list so merchants can clean up history without losing the audit trail until the 30-day hard-delete job runs.
 
 ### `DELETE /payment-requests/{id}`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "payment request is already cancelled", "code": "INVALID_PARAMETERS" }`
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `403 Forbidden` (`FORBIDDEN`): `{ "error": "payment request belongs to another merchant", "code": "FORBIDDEN" }`
+- `404 Not Found` (`PAYMENT_REQUEST_NOT_FOUND`): `{ "error": "payment request not found", "code": "PAYMENT_REQUEST_NOT_FOUND" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. Soft-deletes (archives) a payment request owned by the authenticated merchant by setting `cancelled_at`. Does **not** permanently remove the row.
 
 `200` → same payment-request object with `status: "cancelled"` and `cancelled_at` set.
@@ -452,6 +650,11 @@ Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](
 `200` → `{ "data": [ …objects above… ], "next_cursor": "…" | null }`.
 
 ### `GET /payment-requests/{id}`
+#### Error Responses
+- `404 Not Found` (`PAYMENT_REQUEST_NOT_FOUND`): `{ "error": "payment request not found", "code": "PAYMENT_REQUEST_NOT_FOUND" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 **No auth** — deliberately public, so a customer's device can read a request before paying.
 
 `200` → same object. `404` if the id doesn't exist.
@@ -468,6 +671,11 @@ Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](
 `expired` is computed at read time, so it's accurate the moment you fetch it. A request that expires and is *then* paid still flips to `paid` — expiry doesn't block correlation. `cancelled` always wins over `expired` at read time.
 
 ### `GET /payment-requests/{id}/status`
+#### Error Responses
+- `404 Not Found` (`PAYMENT_REQUEST_NOT_FOUND`): `{ "error": "payment request not found", "code": "PAYMENT_REQUEST_NOT_FOUND" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 **No auth** — lightweight public poll for customers after they submit a Stellar payment.
 
 `200` →
@@ -486,6 +694,11 @@ Deposit detection still runs on a timer (`STELLAR_POLL_INTERVAL_SECS`, default 6
 `404` if the id doesn't exist.
 
 ### `GET /payment-requests/{id}/status`
+#### Error Responses
+- `404 Not Found` (`PAYMENT_REQUEST_NOT_FOUND`): `{ "error": "payment request not found", "code": "PAYMENT_REQUEST_NOT_FOUND" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 **No auth** — public like the parent endpoint. A lightweight, status-only view of a payment request, for high-frequency polling. It returns none of the heavy fields (`amount_stroops`, `address`, `sep7_uri`, …), just enough to drive a "waiting for payment" screen.
 
 `200` →
@@ -506,6 +719,12 @@ Poll this instead of the full object when you only need the status — it's the 
 ---
 
 ### `GET /balance`
+#### Error Responses
+- `400 Bad Request` (`MERCHANT_NOT_FOUND`): `{ "error": "no merchant associated with this account", "code": "MERCHANT_NOT_FOUND" }`
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. One row per asset the merchant has ever held. Returns `[]` for a new merchant — not an error.
 
 `200` →
@@ -523,8 +742,30 @@ Auth required. One row per asset the merchant has ever held. Returns `[]` for a 
 
 `available` is withdrawable; `pending` is detected but not yet confirmed. In practice `pending` is almost always `0` — deposits currently move to confirmed immediately (no confirmation-depth threshold yet).
 
+**Planned response envelope (#1247).** The supported assets are `XLM` and `cNGN`. The planned shape wraps the list so a new merchant sees a zero entry per supported asset instead of `[]`:
+
+```json
+{
+  "supported_assets": ["XLM", "cNGN"],
+  "balances": [
+    { "merchant_id": "6a91d75c-…", "asset": "XLM",  "available": 0, "pending": 0, "updated_at": null },
+    { "merchant_id": "6a91d75c-…", "asset": "cNGN", "available": 0, "pending": 0, "updated_at": null }
+  ]
+}
+```
+
+`updated_at` is `null` for a synthesized zero entry (no row exists yet). Until the server change lands (it touches protected `src/`), clients should treat a missing asset in today's array as a zero balance. See [`docs/proposals/1247-balance-supported-assets.md`](docs/proposals/1247-balance-supported-assets.md).
+
 ### `GET /transactions`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "invalid cursor", "code": "INVALID_PARAMETERS" }`
+- `400 Bad Request` (`MERCHANT_NOT_FOUND`): `{ "error": "no merchant associated with this account", "code": "MERCHANT_NOT_FOUND" }`
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. Detected incoming payments, newest first. Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](#pagination)). The response is a page: `{ "data": [...], "next_cursor": ... }`, with `data` items like this:
+Auth required. Detected incoming payments, newest first. Query: `?limit=` (default 50, clamped 1–200), `?cursor=` (see [Pagination](#pagination)), and the optional filters `?asset=` (exact match, e.g. `XLM` or `cNGN`) and `?status=` (`detected`, `verified`, `confirmed` or `failed`; anything else is `400 INVALID_PARAMETERS`). Filters combine with pagination: keep sending the same `asset`/`status` alongside each `cursor`. The response is a page: `{ "data": [...], "next_cursor": ... }`, with `data` items like this:
 
 `200` →
 ```json
@@ -553,6 +794,20 @@ Auth required. Detected incoming payments, newest first. Query: `?limit=` (defau
 ---
 
 ### `POST /withdraw`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "must be a 10-digit NUBAN account number", "code": "INVALID_PARAMETERS", "field": "account_number" }` (other fields can be `amount_stroops`, `bank_code`, or `Idempotency-Key`)
+- `400 Bad Request` (`INVALID_AMOUNT`): `{ "error": "amount_stroops must be a whole number of kobo", "code": "INVALID_AMOUNT" }`
+- `400 Bad Request` (`INSUFFICIENT_BALANCE`): `{ "error": "insufficient available balance", "code": "INSUFFICIENT_BALANCE" }`
+- `400 Bad Request` (`UNSUPPORTED_ASSET`): `{ "error": "withdrawals are only supported for the cNGN asset", "code": "UNSUPPORTED_ASSET" }`
+- `400 Bad Request` (`MERCHANT_NOT_FOUND`): `{ "error": "no merchant associated with this account", "code": "MERCHANT_NOT_FOUND" }`
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `403 Forbidden` (`FORBIDDEN`): `{ "error": "this merchant account has been suspended", "code": "FORBIDDEN" }`
+- `413 Payload Too Large` (`PAYLOAD_TOO_LARGE`): `{ "error": "request body too large", "code": "PAYLOAD_TOO_LARGE" }`
+- `415 Unsupported Media Type` (`INVALID_PARAMETERS`): `{ "error": "content-type must be application/json", "code": "INVALID_PARAMETERS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+- `502 Bad Gateway` (`PAYOUT_FAILED`): `{ "error": "<provider message>", "code": "PAYOUT_FAILED" }`
+
+#### Request and Success
 Auth required. Debits the merchant's balance and initiates a Nigerian bank payout via Paystack.
 
 ```json
@@ -610,6 +865,13 @@ When the upstream payout provider (Paystack) rejects or fails the transfer, the 
 > **Payouts do not currently complete in production.** The Paystack integration is real, but Aframp's Paystack balance is unfunded, so live calls often return `502` with *"Your balance is not enough to fulfil this request."* That is still a `PAYOUT_FAILED` — same no-retry rules. Paystack's own minimum transfer is ₦50 = `500000000` stroops.
 
 ### `GET /withdrawals`
+#### Error Responses
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "invalid cursor", "code": "INVALID_PARAMETERS" }`
+- `400 Bad Request` (`MERCHANT_NOT_FOUND`): `{ "error": "no merchant associated with this account", "code": "MERCHANT_NOT_FOUND" }`
+- `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
+- `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
+
+#### Request and Success
 Auth required. Newest first. Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](#pagination)).
 
 `200` → a page, `{ "data": [...], "next_cursor": ... }`, with `data` items like:
@@ -666,6 +928,8 @@ Note step 3 needs no auth token, so a customer-facing payment page can use it di
 ---
 
 ## Admin access
+#### Admin endpoint errors
+Every `/admin/*` data endpoint can return `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "missing session cookie or bearer token", "code": "INVALID_CREDENTIALS" }`, or `403 Forbidden` (`FORBIDDEN`): `{ "error": "admin access required", "code": "FORBIDDEN" }`. Unexpected failures return `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`.
 
 Admin routes (`/admin/*`) require the `is_admin` flag on the user row. There is no self-service way to become an admin — set it directly in Postgres:
 
@@ -705,6 +969,54 @@ The `/admin` dashboard's login form uses the old one-step `/login` flow. If the 
 
 3. **The dashboard now handles the OTP step inline** — if `/login` returns a `challenge_id`, a code-entry form is shown automatically (see the updated `admin_dashboard.html`).
 
+### `GET /analytics/payments`
+
+Auth required. Returns daily confirmed-payment aggregates for the authenticated merchant.
+
+**Query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `from` | ISO 8601 date (`YYYY-MM-DD`) | today − 29 days | Start date, inclusive (midnight UTC). |
+| `to`   | ISO 8601 date (`YYYY-MM-DD`) | today           | End date, inclusive (23:59:59 UTC). |
+
+The window may span at most **366 days**. A wider window returns `400 INVALID_PARAMETERS`.
+
+**Filters:** Only `status = confirmed` payments are counted. In-flight payments (`detected`, `verified`) are excluded.
+
+`200` → a sparse list of days that had at least one confirmed payment, ordered ascending:
+
+```json
+{
+  "from": "2026-09-19",
+  "to": "2026-10-19",
+  "data": [
+    { "date": "2026-10-01", "count": 3, "total_stroops": 30000000, "asset": "XLM" },
+    { "date": "2026-10-03", "count": 1, "total_stroops":  5000000, "asset": "XLM" }
+  ]
+}
+```
+
+Days with no confirmed payments are **omitted** (sparse). Clients must fill date gaps themselves when rendering charts.
+
+Each item in `data`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `date` | string (`YYYY-MM-DD`) | UTC calendar date of the bucket. |
+| `count` | integer | Number of confirmed payments on this date for this asset. |
+| `total_stroops` | integer | Sum of `amount_stroops` for all confirmed payments in this bucket. |
+| `asset` | string | Asset code — `XLM`, `cNGN`, etc. |
+
+**Error responses:**
+
+| Status | Code | When |
+|--------|------|------|
+| `400` | `INVALID_PARAMETERS` | Malformed date, `from` after `to`, or window > 366 days. |
+| `401` | `INVALID_CREDENTIALS` | Missing or expired token. |
+
+---
+
 ## Not available yet
 
 Worth knowing before you design around them:
@@ -717,6 +1029,6 @@ Worth knowing before you design around them:
 - **No rate limiting on the password check itself.** OTP sends are throttled (60s cooldown, 5/hour per phone), but nothing yet stops repeated wrong-password guesses against `/login` before it ever gets to that step.
 - **No cancel/delete on payment requests.** They can only expire naturally.
 - **`DELETE /payment-requests/{id}`** soft-cancels a request (sets `cancelled_at`). CORS allows `GET`/`POST`/`DELETE`.
-- **Merchant analytics** (`GET /analytics?period=7d|30d|90d`) is a proposed contract only and is not available until the endpoint is implemented. The proposed response includes daily confirmed-payment counts and volume by asset in stroops, paid requests created in the selected period, and a 0–1 paid-request success rate.
+- **Legacy analytics endpoint** (`GET /analytics?period=7d|30d|90d`) is a proposed contract only and is not currently served. See `GET /analytics/payments` for the implemented contract.
 - **cNGN QR codes**, pending a real issuer address.
 - **Completed payouts**, pending funding (see `PRD.md` §9.1).
