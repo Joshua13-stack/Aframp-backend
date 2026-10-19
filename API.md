@@ -748,12 +748,12 @@ Auth required. One row per asset the merchant has ever held. Returns `[]` for a 
 ### `GET /transactions`
 #### Error Responses
 - `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "invalid cursor", "code": "INVALID_PARAMETERS" }`
+- `400 Bad Request` (`INVALID_PARAMETERS`): `{ "error": "status must be one of detected, verified, confirmed, failed", "code": "INVALID_PARAMETERS" }`
 - `400 Bad Request` (`MERCHANT_NOT_FOUND`): `{ "error": "no merchant associated with this account", "code": "MERCHANT_NOT_FOUND" }`
 - `401 Unauthorized` (`INVALID_CREDENTIALS`): `{ "error": "invalid or expired token", "code": "INVALID_CREDENTIALS" }`
 - `500 Internal Server Error` (`INTERNAL_ERROR`): `{ "error": "internal server error", "code": "INTERNAL_ERROR" }`
 
 #### Request and Success
-Auth required. Detected incoming payments, newest first. Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](#pagination)). The response is a page: `{ "data": [...], "next_cursor": ... }`, with `data` items like this:
 Auth required. Detected incoming payments, newest first. Query: `?limit=` (default 50, clamped 1–200), `?cursor=` (see [Pagination](#pagination)), and the optional filters `?asset=` (exact match, e.g. `XLM` or `cNGN`) and `?status=` (`detected`, `verified`, `confirmed` or `failed`; anything else is `400 INVALID_PARAMETERS`). Filters combine with pagination: keep sending the same `asset`/`status` alongside each `cursor`. The response is a page: `{ "data": [...], "next_cursor": ... }`, with `data` items like this:
 
 `200` →
