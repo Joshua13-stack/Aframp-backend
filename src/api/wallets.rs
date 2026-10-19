@@ -39,10 +39,24 @@ pub async fn create(
         &state.db,
         merchant_id,
         &network,
-        &state.wallet_encryption_key,
+        state.wallet_encryption_key.expose(),
     )
     .await
     .map_err(internal)?;
+    let wallet = wallets::create_wallet(&state.db, merchant_id, &network, state.wallet_encryption_key.expose())
+        .await
+        .map_err(|e| match e {
+            CreateWalletError::AlreadyExists => {
+                bad_request(ErrorCode::WalletAlreadyExists, "merchant already has a wallet")
+            }
+            CreateWalletError::Db(err) => internal(err),
+        .map_err(|err| match err {
+            CreateWalletError::AlreadyExists => conflict(
+                ErrorCode::InvalidParameters,
+                "a wallet already exists for this merchant; use GET /wallet to retrieve it",
+            ),
+            other => internal(other),
+        })?;
     Ok(Json(wallet))
 }
 
