@@ -3,7 +3,7 @@ mod common;
 use axum::http::StatusCode;
 use serde_json::json;
 
-use common::{ensure_merchant, send, state};
+use common::{assert_no_sensitive_fields_json, ensure_merchant, send, state};
 
 async fn create_wallet(app: &axum::Router, token: &str) {
     let (status, json) = send(app.clone(), "POST", "/wallet/create", Some(token), Some(json!({}))).await;
@@ -48,6 +48,7 @@ async fn payment_request_create_and_fetch_publicly() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "create failed: {created}");
+    assert_no_sensitive_fields_json(&created);
     assert_eq!(created["status"], "pending");
     assert_eq!(created["asset"], "XLM", "default asset should be XLM, not cNGN");
     assert_eq!(created["merchant_id"], merchant_id);
@@ -61,6 +62,7 @@ async fn payment_request_create_and_fetch_publicly() {
     let id = created["id"].as_str().unwrap();
     let (status, fetched) = send(app.clone(), "GET", &format!("/payment-requests/{id}"), None, None).await;
     assert_eq!(status, StatusCode::OK, "public fetch failed: {fetched}");
+    assert_no_sensitive_fields_json(&fetched);
     assert_eq!(fetched["id"], created["id"]);
     assert_eq!(fetched["status"], "pending");
 }
@@ -157,6 +159,7 @@ async fn payment_request_list_is_scoped_to_the_authenticated_merchant() {
 
     let (status, list_a) = send(app.clone(), "GET", "/payment-requests", Some(&token_a), None).await;
     assert_eq!(status, StatusCode::OK, "list failed: {list_a}");
+    assert_no_sensitive_fields_json(&list_a);
     let rows = list_a.as_array().unwrap();
     assert_eq!(rows.len(), 2, "merchant A should see only their own two requests");
     // Newest first.
@@ -169,6 +172,7 @@ async fn payment_request_list_is_scoped_to_the_authenticated_merchant() {
 
     let (status, list_b) = send(app.clone(), "GET", "/payment-requests", Some(&token_b), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&list_b);
     let rows_b = list_b.as_array().unwrap();
     assert_eq!(rows_b.len(), 1, "merchant B must not see merchant A's requests");
     assert_eq!(rows_b[0]["amount_stroops"], 99_000_000);
@@ -242,5 +246,6 @@ async fn payment_request_marked_paid_on_memo_correlated_deposit() {
 
     let (status, fetched) = send(app.clone(), "GET", &format!("/payment-requests/{id}"), None, None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&fetched);
     assert_eq!(fetched["status"], "paid");
 }

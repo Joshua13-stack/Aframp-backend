@@ -3,7 +3,7 @@ mod common;
 use axum::http::StatusCode;
 use serde_json::json;
 
-use common::{send, state};
+use common::{assert_no_sensitive_fields_json, send, state};
 
 async fn app() -> Option<axum::Router> {
     state().await.map(aframp::router)

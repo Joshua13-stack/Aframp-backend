@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::json;
 
-use common::{ensure_merchant, send, state};
+use common::{assert_no_sensitive_fields_json, ensure_merchant, send, state};
 
 struct FailingProvider;
 
@@ -146,6 +146,7 @@ async fn withdrawal_success_decrements_balance() {
 
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
     assert_eq!(json.as_array().unwrap().len(), 1);
 }
 
@@ -312,6 +313,7 @@ async fn withdrawal_payout_failure_refunds_balance_and_records_reason() {
 
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
     let withdrawals = json.as_array().unwrap();
     assert_eq!(withdrawals.len(), 1, "the failed attempt should still leave an audit-trail row");
     assert_eq!(withdrawals[0]["status"], "failed");
@@ -393,6 +395,7 @@ async fn withdrawal_invalid_bank_code_refunds_balance_and_records_reason() {
 
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
     let withdrawals = json.as_array().unwrap();
     assert_eq!(withdrawals[0]["status"], "failed");
     assert_eq!(withdrawals[0]["failure_reason"], "Invalid bank code");
@@ -443,6 +446,7 @@ async fn withdrawal_invalid_account_number_refunds_balance_and_records_reason() 
 
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
     let withdrawals = json.as_array().unwrap();
     assert_eq!(withdrawals[0]["status"], "failed");
     assert_eq!(withdrawals[0]["failure_reason"], "Could not resolve account number");
@@ -493,6 +497,7 @@ async fn withdrawal_paystack_timeout_refunds_balance_and_records_reason() {
 
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
     let withdrawals = json.as_array().unwrap();
     assert_eq!(withdrawals[0]["status"], "failed");
     assert_eq!(withdrawals[0]["failure_reason"], "request to Paystack timed out");
