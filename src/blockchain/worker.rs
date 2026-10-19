@@ -81,11 +81,30 @@ pub async fn poll_once<L: BlockchainListener>(
     Ok(())
 }
 
+/// Returns true only when the deposit's destination is exactly the address of
+/// the wallet that would be credited.
+pub fn destination_matches_wallet(wallet_address: &str, destination: &str) -> bool {
+    wallet_address == destination
+}
+
 pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), String> {
     let Some(wallet) = wallets::wallet_by_address(db, &d.destination).await.map_err(|e| e.to_string())?
     else {
         return Ok(());
     };
+    // Defence in depth: never credit a wallet whose address doesn't match the
+    // deposit destination, even if address → wallet resolution misbehaves.
+    if !destination_matches_wallet(&wallet.address, &d.destination) {
+        tracing::warn!(
+            wallet_id = %wallet.id,
+            merchant_id = %wallet.merchant_id,
+            wallet_address = %wallet.address,
+            destination = %d.destination,
+            tx_hash = %d.tx_hash,
+            "deposit destination does not match resolved wallet address — skipping"
+        );
+        return Ok(());
+    }
     let memo = d.memo.clone();
 
     let (payment, inserted) = payments::record_deposit(
@@ -195,6 +214,27 @@ pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), Stri
 
     // TODO: dispatch payment.confirmed webhook.
     Ok(())
+}
+
+#[cfg(test)]
+mod destination_check_tests {
+    use super::destination_matches_wallet;
+
+    #[test]
+    fn matching_destination_is_accepted() {
+        let addr = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        assert!(destination_matches_wallet(addr, addr));
+    }
+
+    #[test]
+    fn mismatched_destination_is_rejected() {
+        assert!(!destination_matches_wallet(
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBWHF",
+        ));
+        assert!(!destination_matches_wallet("GABC", "gabc"));
+        assert!(!destination_matches_wallet("GABC", ""));
+    }
 }
 
 #[cfg(test)]

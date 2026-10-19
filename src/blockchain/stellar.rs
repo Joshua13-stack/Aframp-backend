@@ -152,6 +152,138 @@ impl BlockchainListener for StellarListener {
 mod tests {
     use super::*;
 
+    // Regression for #1225: a single pooled `reqwest::Client` is held on the
+    // listener and reused across poll cycles instead of being rebuilt per call.
+    #[test]
+    fn horizon_client_uses_fifteen_second_timeout() {
+        assert_eq!(HORIZON_TIMEOUT, Duration::from_secs(15));
+        let _listener = StellarListener::new("https://horizon-testnet.stellar.org".into());
+        assert!(StellarListener::new("https://horizon-testnet.stellar.org".into())
+            .skipped_addresses()
+            .is_empty());
+    }
+
+    #[test]
+    fn parses_whole_and_fractional_amounts() {
+        assert_eq!(parse_amount_to_stroops("10000.0000000").unwrap(), 100_000_000_000);
+        assert_eq!(parse_amount_to_stroops("0.5").unwrap(), 5_000_000);
+        assert_eq!(parse_amount_to_stroops("1").unwrap(), 10_000_000);
+        assert_eq!(parse_amount_to_stroops("123.4567890").unwrap(), 1_234_567_890);
+    }
+
+    #[test]
+    fn rejects_excess_precision() {
+        assert!(parse_amount_to_stroops("1.12345678").is_err());
+    }
+
+    // --------------------------------------------------------------------------
+    // #911 — path_payment_strict_send uses `destination`, not `to`
+    // --------------------------------------------------------------------------
+
+    fn make_record(op_type: &str) -> OperationRecord {
+        OperationRecord {
+            op_type: op_type.to_string(),
+            transaction_successful: true,
+            transaction_hash: "abc123".to_string(),
+            ledger: Some(1234),
+            to: None,
+            destination: None,
+            account: None,
+            amount: None,
+            amount_sent: None,
+            starting_balance: None,
+            asset_type: Some("native".to_string()),
+            asset_code: None,
+            asset: None,
+            claimant: None,
+            transaction: None,
+        }
+    }
+
+    #[test]
+    fn path_payment_strict_send_matched_via_destination_field() {
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("path_payment_strict_send");
+        rec.destination = Some(addr.to_string());
+        rec.amount = Some("5.0000000".to_string());
+
+        let deposit = record_to_deposit(rec, addr).expect("strict_send should be detected");
+        assert_eq!(deposit.amount_stroops, 50_000_000);
+        assert_eq!(deposit.destination, addr);
+    }
+
+    #[test]
+    fn path_payment_strict_send_ignored_when_to_field_used() {
+        // A strict_send op with only `to` set (not `destination`) must NOT match —
+        // the old code incorrectly checked `to` for this op type.
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("path_payment_strict_send");
+        rec.to = Some(addr.to_string());
+        rec.amount = Some("5.0000000".to_string());
+
+        assert!(record_to_deposit(rec, addr).is_none());
+    }
+
+    #[test]
+    fn path_payment_strict_send_ignored_for_wrong_destination() {
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("path_payment_strict_send");
+        rec.destination = Some("GOTHER...ACCOUNT".to_string());
+        rec.amount = Some("5.0000000".to_string());
+
+        assert!(record_to_deposit(rec, addr).is_none());
+    }
+
+    #[test]
+    fn regular_payment_still_uses_to_field() {
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("payment");
+        rec.to = Some(addr.to_string());
+        rec.amount = Some("10.0000000".to_string());
+
+        let deposit = record_to_deposit(rec, addr).expect("payment should be detected");
+        assert_eq!(deposit.amount_stroops, 100_000_000);
+    }
+
+    // --------------------------------------------------------------------------
+    // #916 — claimable_balance_created deposit detection
+    // --------------------------------------------------------------------------
+
+    #[test]
+    fn claimable_balance_created_detected_when_claimant_matches() {
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("claimable_balance_created");
+        rec.claimant = Some(ClaimantInfo {
+            destination: addr.to_string(),
+        });
+        rec.amount = Some("3.5000000".to_string());
+
+        let deposit =
+            record_to_deposit(rec, addr).expect("claimable_balance_created should be detected");
+        assert_eq!(deposit.amount_stroops, 35_000_000);
+    }
+
+    #[test]
+    fn claimable_balance_created_ignored_when_claimant_is_other() {
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("claimable_balance_created");
+        rec.claimant = Some(ClaimantInfo {
+            destination: "GOTHER...ACCOUNT".to_string(),
+        });
+        rec.amount = Some("3.5000000".to_string());
+
+        assert!(record_to_deposit(rec, addr).is_none());
+    }
+
+    #[test]
+    fn claimable_balance_created_ignored_without_claimant() {
+        let addr = "GDESK...WALLET";
+        let mut rec = make_record("claimable_balance_created");
+        rec.amount = Some("3.5000000".to_string());
+
+        assert!(record_to_deposit(rec, addr).is_none());
+    }
+
     // --------------------------------------------------------------------------
     // #921 — unfunded wallet exponential backoff
     // --------------------------------------------------------------------------

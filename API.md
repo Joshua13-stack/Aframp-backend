@@ -4,6 +4,7 @@ Everything documented here is implemented and covered by integration tests again
 
 - **Base URL (dev):** `http://127.0.0.1:3000`
 - **Content type:** `application/json` on every request with a body
+- **Request body limit:** 64KB (65,536 bytes) by default, configurable server-side via `MAX_REQUEST_BODY_BYTES`. Larger bodies are rejected with `413 Payload Too Large` before reaching any handler. Every current endpoint needs well under 1KB.
 - **Machine-readable spec:** [`openapi.yaml`](openapi.yaml) — generate a typed client from it rather than hand-writing calls
 
 ---
@@ -232,6 +233,44 @@ Never use floating-point arithmetic to accumulate balances — convert for displ
 
 ---
 
+## Amounts and Denominations
+
+All monetary values in this API are integers denominated in **stroops** — the
+smallest unit of Stellar assets. Never send whole units.
+
+- `1 XLM = 10,000,000 stroops`
+- `1 cNGN = 10,000,000 stroops`
+- `1 cNGN stroop = 100,000 kobo` (i.e. `1 cNGN` = `100 kobo`)
+
+Conversion formula:
+
+```
+amount_stroops = whole_units × 10,000,000
+```
+
+| Whole units | `amount_stroops` |
+|---|---|
+| 0.0000001 XLM | 1 (minimum) |
+| 1 XLM / 1 cNGN | 10,000,000 |
+| 2.5 XLM | 25,000,000 |
+| 50 cNGN | 500,000,000 |
+| 2,500 cNGN (₦2,500) | 25,000,000,000 |
+
+Example: `₦2,500 = 25,000,000,000 cNGN stroops`.
+
+> **Warning:** the most common integration mistake is sending amounts in whole
+> units (e.g. `25`) instead of stroops (`250,000,000`). That creates a payment
+> for `0.0000025` units. Always multiply by `10,000,000` before sending, and
+> never use floating-point arithmetic to accumulate balances — convert for
+> display only.
+
+```js
+const toDisplay = (stroops) => (stroops / 10_000_000).toFixed(7);
+const toStroops = (amount) => Math.round(amount * 10_000_000);
+```
+
+---
+
 ## Pagination
 
 `GET /transactions`, `GET /payment-requests` and `GET /withdrawals` return
@@ -319,6 +358,23 @@ Auth required (bearer or session cookie).
 Re-proves the current password, then replaces it. `200` → a fresh session with the same body shape as `/verify-otp`, also set as the session cookie, so the device that made the change stays signed in. **Every other session for the account stops working immediately** — including ones that were refreshed via `/auth/refresh`, since refreshes keep the original login time.
 
 Errors: `400` with `field: "new_password"` if it's shorter than 8 characters; `400` with `field: "current_password"` if the current password is wrong (deliberately not `401`, which clients treat as "session expired"); `401` for a missing, expired or already-revoked session.
+### `GET /verify-email`
+No auth. Consumes the single-use, 24-hour token from the verification email
+sent when a signup completes or a resend is requested.
+
+```
+GET /verify-email?token=<hex-token>
+```
+
+`200` → `{ "email_verified": true }`. Unknown, already-used, or expired tokens
+return `400` `INVALID_PARAMETERS` ("invalid or expired email verification
+token"), and an empty `token` returns `400` with `field: "token"`.
+
+### `POST /verify-email/resend`
+Auth required. Issues a fresh verification link for the signed-in account,
+invalidating any previous token. Returns `200` `{ "sent": true }`. Because no
+transactional email provider is wired into the backend yet, the link is emitted
+through structured logs (`verification_link`).
 
 ### `POST /logout`
 No auth — a browser holding an expired or malformed session still needs to clear it. Returns `204` and a `Set-Cookie` that expires `aframp_session` immediately.
@@ -344,6 +400,27 @@ Auth required. The signed-in user's profile. The JWT carries only ids, so call t
 
 `merchant_id` and `merchant_name` are `null` for an account with no merchant. The password hash is never serialized.
 `phone_number` is `null` for legacy accounts without a number; `phone_verified` is `false` until phone verification succeeds.
+
+---
+
+### `GET /merchants/me`
+Auth required. The signed-in user's merchant profile on its own, separate from `GET /me`. Returns the full `Merchant` model so richer business data (address, logo, bank account, verification status) can grow here without bloating the auth-identity endpoint.
+
+`200` →
+```json
+{
+  "id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
+  "user_id": "2c5e0ee2-7f87-4efb-b1c9-d7e1b3ee0eeb",
+  "name": "Shop Name",
+  "email": "merchant@example.com",
+  "email_notifications_enabled": true,
+  "unsubscribe_token": null,
+  "suspended_at": null,
+  "created_at": "2026-08-13T14:15:34.232320Z",
+  "updated_at": "2026-08-13T14:15:34.232320Z"
+}
+```
+`404` with `MERCHANT_NOT_FOUND` when the account has no merchant profile. `email`, `unsubscribe_token` and `suspended_at` are `null` when unset.
 
 ---
 
@@ -524,7 +601,7 @@ Auth required. One row per asset the merchant has ever held. Returns `[]` for a 
 `available` is withdrawable; `pending` is detected but not yet confirmed. In practice `pending` is almost always `0` — deposits currently move to confirmed immediately (no confirmation-depth threshold yet).
 
 ### `GET /transactions`
-Auth required. Detected incoming payments, newest first. Query: `?limit=` (default 50, clamped 1–200) and `?cursor=` (see [Pagination](#pagination)). The response is a page: `{ "data": [...], "next_cursor": ... }`, with `data` items like this:
+Auth required. Detected incoming payments, newest first. Query: `?limit=` (default 50, clamped 1–200), `?cursor=` (see [Pagination](#pagination)), and the optional filters `?asset=` (exact match, e.g. `XLM` or `cNGN`) and `?status=` (`detected`, `verified`, `confirmed` or `failed`; anything else is `400 INVALID_PARAMETERS`). Filters combine with pagination: keep sending the same `asset`/`status` alongside each `cursor`. The response is a page: `{ "data": [...], "next_cursor": ... }`, with `data` items like this:
 
 `200` →
 ```json
