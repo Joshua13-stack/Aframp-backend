@@ -4,7 +4,7 @@ pub mod blockchain;
 mod config;
 mod error;
 mod middleware;
-mod models;
+pub mod models;
 mod pagination;
 pub mod otp;
 pub mod payments;

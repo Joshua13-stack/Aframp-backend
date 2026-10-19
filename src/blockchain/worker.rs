@@ -106,6 +106,7 @@ pub async fn process_deposit(
     .await
     .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?;
 
+    if payment.status != crate::models::status::PaymentStatus::Detected {
     if payment.status != "detected" {
         return Ok(());
     }
