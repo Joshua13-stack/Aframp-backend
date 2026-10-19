@@ -12,7 +12,7 @@ pub mod services;
 mod validation;
 
 pub use auth::cookie::{CookieConfig, SameSite};
-pub use config::{AppConfig, OtpProviderKind, SecretString};
+pub use config::{AppConfig, OtpProviderKind, SecretBytes, SecretString};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::broadcast;
@@ -53,7 +53,7 @@ pub struct AppState {
     /// TODO: wire `decrypt_wallet_secret` into the settlement/sweep feature
     /// so the platform wallet can sign outbound transactions on behalf of a
     /// merchant.  See PRD §settlement-sweep.
-    pub wallet_encryption_key: std::sync::Arc<[u8; 32]>,
+    pub wallet_encryption_key: std::sync::Arc<SecretBytes<32>>,
     pub payment_provider: std::sync::Arc<dyn payments::PaymentProvider>,
     pub otp_provider: std::sync::Arc<dyn otp::OtpProvider>,
     pub otp_hmac_secret: SecretString,
@@ -97,7 +97,7 @@ pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::er
         db,
         jwt_secret: config.jwt_secret.clone(),
         webhook_secret: config.webhook_secret.clone(),
-        wallet_encryption_key: std::sync::Arc::new(wallet_encryption_key),
+        wallet_encryption_key: std::sync::Arc::new(SecretBytes::new(wallet_encryption_key)),
         payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
             config.paystack_secret_key.as_str().to_string(),
         )),
@@ -118,7 +118,7 @@ pub struct AppState {
     pub db: PgPool,
     pub jwt_secret: SecretString,
     pub webhook_secret: SecretString,
-    pub wallet_encryption_key: std::sync::Arc<[u8; 32]>,
+    pub wallet_encryption_key: std::sync::Arc<SecretBytes<32>>,
     pub payment_provider: std::sync::Arc<dyn payments::PaymentProvider>,
     pub otp_provider: std::sync::Arc<dyn otp::OtpProvider>,
     pub otp_hmac_secret: SecretString,
@@ -136,6 +136,12 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/logout", axum::routing::post(api::auth::logout))
         .route("/webhooks/termii", axum::routing::post(api::webhooks::termii))
         .route("/me", axum::routing::get(api::me::get))
+        .route("/users/me", axum::routing::patch(api::me::update))
+        .route("/merchants/me", axum::routing::patch(api::merchants::update))
+        .route(
+            "/merchants/me/email/confirm",
+            axum::routing::post(api::merchants::confirm_email),
+        )
         .route("/wallet/create", axum::routing::post(api::wallets::create))
         .route("/wallet", axum::routing::get(api::wallets::get))
         .route("/balance", axum::routing::get(api::balances::get))
@@ -212,7 +218,7 @@ pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::er
         db,
         jwt_secret: config.jwt_secret.clone(),
         webhook_secret: config.webhook_secret.clone(),
-        wallet_encryption_key: std::sync::Arc::new(wallet_encryption_key),
+        wallet_encryption_key: std::sync::Arc::new(SecretBytes::new(wallet_encryption_key)),
         payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
             config.paystack_secret_key.as_str().to_string(),
         )),
@@ -237,6 +243,12 @@ pub fn router(state: AppState) -> axum::Router {
             axum::routing::get(api::me::get)
                 .patch(api::me::update)
                 .delete(api::me::delete),
+        )
+        .route("/users/me", axum::routing::patch(api::me::update))
+        .route("/merchants/me", axum::routing::patch(api::merchants::update))
+        .route(
+            "/merchants/me/email/confirm",
+            axum::routing::post(api::merchants::confirm_email),
         )
         .route("/wallet/create", axum::routing::post(api::wallets::create))
         .route("/wallet", axum::routing::get(api::wallets::get))
@@ -292,7 +304,7 @@ mod cors_tests {
             db,
             jwt_secret: SecretString::new("test-jwt-secret".to_string()),
             webhook_secret: SecretString::new("test-webhook-secret".to_string()),
-            wallet_encryption_key: std::sync::Arc::new([0u8; 32]),
+            wallet_encryption_key: std::sync::Arc::new(SecretBytes::new([0u8; 32])),
             payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
                 "test-paystack-key".to_string(),
             )),

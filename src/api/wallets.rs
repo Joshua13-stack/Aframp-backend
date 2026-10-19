@@ -26,11 +26,11 @@ pub async fn create(
         &state.db,
         merchant_id,
         &network,
-        &state.wallet_encryption_key,
+        state.wallet_encryption_key.expose(),
     )
     .await
     .map_err(internal)?;
-    let wallet = wallets::create_wallet(&state.db, merchant_id, &network, &state.wallet_encryption_key)
+    let wallet = wallets::create_wallet(&state.db, merchant_id, &network, state.wallet_encryption_key.expose())
         .await
         .map_err(|e| match e {
             CreateWalletError::AlreadyExists => {
