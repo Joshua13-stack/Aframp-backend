@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::auth::cookie::{CookieConfig, SameSite};
 
 /// Default request body limit (1MB) used when `MAX_REQUEST_BODY_BYTES` is unset.
-pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct SecretString(Arc<String>);
@@ -103,7 +103,8 @@ pub struct AppConfig {
     pub cookie: CookieConfig,
     /// Maximum accepted request body size in bytes. Applied via
     /// `RequestBodyLimitLayer`; requests over this limit are rejected with a
-    /// 413 before reaching a handler. Defaults to 1MB.
+    /// 413 before reaching a handler. Defaults to 64KB, which covers every
+    /// current endpoint (the largest JSON bodies are a few hundred bytes).
     pub max_request_body_bytes: usize,
 }
 
@@ -470,8 +471,8 @@ mod tests {
     }
 
     #[test]
-    fn max_request_body_bytes_defaults_to_one_megabyte() {
-        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 1024 * 1024);
+    fn max_request_body_bytes_defaults_to_64_kilobytes() {
+        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 64 * 1024);
     }
 
     // --- Secret minimum-length enforcement (issue #1099) ---

@@ -12,7 +12,7 @@ pub mod services;
 mod validation;
 
 pub use auth::cookie::{CookieConfig, SameSite};
-pub use config::{AppConfig, OtpProviderKind, SecretString};
+pub use config::{AppConfig, OtpProviderKind, SecretString, DEFAULT_MAX_REQUEST_BODY_BYTES};
 
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use tokio::sync::broadcast;
@@ -99,7 +99,7 @@ pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::er
         webhook_secret: config.webhook_secret.clone(),
         wallet_encryption_key: std::sync::Arc::new(wallet_encryption_key),
         payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
-            config.paystack_secret_key.as_str().to_string(),
+            config.paystack_secret_key.clone(),
         )),
         otp_provider,
         otp_hmac_secret: config.otp_hmac_secret.clone(),
@@ -134,6 +134,12 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/login", axum::routing::post(api::auth::login))
         .route("/verify-otp", axum::routing::post(api::auth::verify_otp))
         .route("/logout", axum::routing::post(api::auth::logout))
+        .route("/auth/change-password", axum::routing::post(api::auth::change_password))
+        .route("/verify-email", axum::routing::get(api::auth::verify_email))
+        .route(
+            "/verify-email/resend",
+            axum::routing::post(api::auth::resend_email_verification),
+        )
         .route("/webhooks/termii", axum::routing::post(api::webhooks::termii))
         .route("/me", axum::routing::get(api::me::get))
         .route("/wallet/create", axum::routing::post(api::wallets::create))
@@ -214,7 +220,7 @@ pub async fn build_state(config: &AppConfig) -> Result<AppState, Box<dyn std::er
         webhook_secret: config.webhook_secret.clone(),
         wallet_encryption_key: std::sync::Arc::new(wallet_encryption_key),
         payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
-            config.paystack_secret_key.as_str().to_string(),
+            config.paystack_secret_key.clone(),
         )),
         otp_provider,
         otp_hmac_secret: config.otp_hmac_secret.clone(),
@@ -230,6 +236,12 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/login", axum::routing::post(api::auth::login))
         .route("/verify-otp", axum::routing::post(api::auth::verify_otp))
         .route("/logout", axum::routing::post(api::auth::logout))
+        .route("/auth/change-password", axum::routing::post(api::auth::change_password))
+        .route("/verify-email", axum::routing::get(api::auth::verify_email))
+        .route(
+            "/verify-email/resend",
+            axum::routing::post(api::auth::resend_email_verification),
+        )
         .route("/auth/refresh", axum::routing::post(api::auth::refresh))
         .route("/webhooks/termii", axum::routing::post(api::webhooks::termii))
         .route(
@@ -238,6 +250,7 @@ pub fn router(state: AppState) -> axum::Router {
                 .patch(api::me::update)
                 .delete(api::me::delete),
         )
+        .route("/merchants/me", axum::routing::get(api::merchants::get))
         .route("/wallet/create", axum::routing::post(api::wallets::create))
         .route("/wallet", axum::routing::get(api::wallets::get))
         .route("/balance", axum::routing::get(api::balances::get))
@@ -294,7 +307,7 @@ mod cors_tests {
             webhook_secret: SecretString::new("test-webhook-secret".to_string()),
             wallet_encryption_key: std::sync::Arc::new([0u8; 32]),
             payment_provider: std::sync::Arc::new(payments::paystack::PaystackProvider::new(
-                "test-paystack-key".to_string(),
+                SecretString::new("test-paystack-key".to_string()),
             )),
             otp_provider: std::sync::Arc::new(otp::mock::MockOtpProvider),
             otp_hmac_secret: SecretString::new("test-otp-hmac-secret".to_string()),
