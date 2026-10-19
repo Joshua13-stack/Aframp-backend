@@ -12,10 +12,10 @@ use crate::auth::extractor::Session;
 use crate::auth::jwt;
 use crate::auth::password;
 use crate::error::{
-    bad_request, bad_request_field, internal,
+    bad_request, bad_request_field, internal, not_found,
     ApiResult,
 };
-use crate::models::{AuthResponse, LoginRequest, OtpChallengeResponse, SignupRequest, VerifyOtpRequest};
+use crate::models::{AuthResponse, ChangePasswordRequest, LoginRequest, OtpChallengeResponse, SignupRequest, VerifyOtpRequest};
 use crate::services::otp::{self, VerifiedOutcome};
 use crate::services::users;
 use crate::validation::{is_valid_email, normalize_ng_phone_number, validate_name};
@@ -225,6 +225,44 @@ pub async fn refresh(State(state): State<AppState>, Session(claims): Session) ->
     )
 }
 
+/// Changes the signed-in user's password. The current password must be
+/// re-proven even with a valid session, so a hijacked token alone can't lock
+/// the owner out. Every session issued before the change stops working; the
+/// caller gets a fresh session (body + cookie) so this device stays signed in.
+pub async fn change_password(
+    State(state): State<AppState>,
+    Session(claims): Session,
+    Json(req): Json<ChangePasswordRequest>,
+) -> ApiResult<impl IntoResponse> {
+    if req.new_password.len() < 8 {
+        return Err(bad_request_field(
+            "new_password",
+            "must be at least 8 characters",
+        ));
+    }
+
+    users::change_password(&state.db, claims.sub, &req.current_password, &req.new_password)
+        .await
+        .map_err(|err| match err {
+            users::ChangePasswordError::WrongCurrentPassword => bad_request_field(
+                "current_password",
+                "current password is incorrect",
+            ),
+            users::ChangePasswordError::Hash | users::ChangePasswordError::Database(_) => internal(err),
+        })?;
+
+    let token = jwt::sign(&state.jwt_secret, claims.sub, claims.merchant_id, claims.is_admin)
+        .map_err(internal)?;
+    authenticated(
+        &state,
+        AuthResponse {
+            token,
+            user_id: claims.sub,
+            merchant_id: claims.merchant_id,
+        },
+    )
+}
+
 /// Sets the session cookie for browsers and echoes the token for API clients.
 fn authenticated(state: &AppState, body: AuthResponse) -> ApiResult<impl IntoResponse> {
     let cookie = state.cookie.session(&body.token).map_err(internal)?;
@@ -274,4 +312,55 @@ fn map_otp_error(err: OtpError) -> (axum::http::StatusCode, Json<crate::error::A
         OtpError::PhoneTaken => conflict(ErrorCode::PhoneTaken, "phone number already registered"),
         OtpError::SendFailed(_) | OtpError::Database(_) => internal(err),
     }
+}
+
+#[derive(serde::Deserialize)]
+pub struct VerifyEmailQuery {
+    pub token: String,
+}
+
+/// `GET /verify-email?token=...` — consumes a signup verification token and
+/// marks the account's email as verified. No auth: the token itself is the
+/// proof and is single-use / time-limited.
+pub async fn verify_email(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<VerifyEmailQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if query.token.trim().is_empty() {
+        return Err(bad_request_field("token", "must not be empty"));
+    }
+    match crate::services::email_verification::verify_token(&state.db, &query.token).await {
+        Ok(true) => Ok(Json(serde_json::json!({ "email_verified": true }))),
+        Ok(false) => Err(bad_request(
+            crate::error::ErrorCode::InvalidParameters,
+            "invalid or expired email verification token",
+        )),
+        Err(err) => Err(internal(err)),
+    }
+}
+
+/// `POST /verify-email/resend` — issues a fresh verification link for the
+/// authenticated account, replacing any outstanding token.
+pub async fn resend_email_verification(
+    State(state): State<AppState>,
+    Session(claims): Session,
+) -> ApiResult<Json<serde_json::Value>> {
+    let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(internal)?;
+    let email = email.ok_or_else(|| {
+        not_found(
+            crate::error::ErrorCode::InvalidParameters,
+            "account not found",
+        )
+    })?;
+
+    let token = crate::services::email_verification::issue_token(&state.db, claims.sub)
+        .await
+        .map_err(internal)?;
+    crate::services::email_verification::send_verification_email(&email, &token);
+
+    Ok(Json(serde_json::json!({ "sent": true })))
 }

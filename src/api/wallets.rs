@@ -2,13 +2,25 @@ use axum::extract::State;
 use axum::Json;
 
 use crate::auth::extractor::AuthUser;
-use crate::error::{bad_request, internal, not_found, ApiResult, ErrorCode};
-use crate::error::{bad_request, conflict, internal, ApiResult, ErrorCode};
+use crate::error::{bad_request, bad_request_field, internal, not_found, ApiResult, ErrorCode};
 use crate::models::{CreateWalletRequest, Wallet};
 use crate::services::wallets;
-use crate::services::wallets::CreateWalletError;
-use crate::services::wallets::{self, CreateWalletError};
 use crate::AppState;
+
+/// Networks the API is allowed to create wallets on. Anything else is rejected
+/// so the stored `wallets.network` value stays inside a known allowlist.
+const ALLOWED_NETWORKS: [&str; 2] = ["stellar", "testnet"];
+
+fn validate_network(network: &str) -> ApiResult<()> {
+    if ALLOWED_NETWORKS.contains(&network) {
+        Ok(())
+    } else {
+        Err(bad_request_field(
+            "network",
+            "unsupported network; expected one of: stellar, testnet",
+        ))
+    }
+}
 
 pub async fn create(
     State(state): State<AppState>,
@@ -22,15 +34,16 @@ pub async fn create(
         )
     })?;
     let network = req.network.unwrap_or_else(|| "stellar".into());
+    validate_network(&network)?;
     let wallet = wallets::create_wallet(
         &state.db,
         merchant_id,
         &network,
-        &state.wallet_encryption_key,
+        state.wallet_encryption_key.expose(),
     )
     .await
     .map_err(internal)?;
-    let wallet = wallets::create_wallet(&state.db, merchant_id, &network, &state.wallet_encryption_key)
+    let wallet = wallets::create_wallet(&state.db, merchant_id, &network, state.wallet_encryption_key.expose())
         .await
         .map_err(|e| match e {
             CreateWalletError::AlreadyExists => {
@@ -59,4 +72,27 @@ pub async fn get(State(state): State<AppState>, auth: AuthUser) -> ApiResult<Jso
         .map_err(internal)?
         .map(Json)
         .ok_or_else(|| not_found(ErrorCode::WalletNotFound, "no wallet created yet"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #1226 — network must be validated against an allowlist.
+    #[test]
+    fn accepts_allowlisted_networks() {
+        assert!(validate_network("stellar").is_ok());
+        assert!(validate_network("testnet").is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_networks_with_field_error() {
+        let err = validate_network("").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!((err.1).0.field.as_deref(), Some("network"));
+
+        let err = validate_network("ethereum").unwrap_err();
+        assert_eq!(err.0, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!((err.1).0.field.as_deref(), Some("network"));
+    }
 }

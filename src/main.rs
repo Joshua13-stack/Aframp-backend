@@ -7,9 +7,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-/// Default maximum request body size (1MB) used when `MAX_REQUEST_BODY_BYTES`
-/// is not set. This is a request body limit, not a response body limit.
-const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+// Single source of truth for the default request body limit (64KB); see
+// `aframp::config` so tests and the binary can't drift apart.
+use aframp::DEFAULT_MAX_REQUEST_BODY_BYTES;
 
 /// Resolve the request body limit from `MAX_REQUEST_BODY_BYTES`, falling back
 /// to [`DEFAULT_MAX_REQUEST_BODY_BYTES`] when unset or unparseable.

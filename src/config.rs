@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::auth::cookie::{CookieConfig, SameSite};
 
 /// Default request body limit (1MB) used when `MAX_REQUEST_BODY_BYTES` is unset.
-pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct SecretString(Arc<String>);
@@ -41,6 +41,36 @@ impl std::ops::Deref for SecretString {
 
 impl AsRef<str> for SecretString {
     fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Fixed-size secret key material (e.g. the wallet AES-256 key). Like
+/// [`SecretString`], its `Debug` output is `[REDACTED]` so the raw bytes can
+/// never end up in a log line or panic message via `{:?}` on `AppState`.
+#[derive(Clone)]
+pub struct SecretBytes<const N: usize>([u8; N]);
+
+impl<const N: usize> SecretBytes<N> {
+    pub fn new(bytes: [u8; N]) -> Self {
+        SecretBytes(bytes)
+    }
+
+    pub fn expose(&self) -> &[u8; N] {
+        &self.0
+    }
+}
+
+impl<const N: usize> fmt::Debug for SecretBytes<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[REDACTED]")
+    }
+}
+
+impl<const N: usize> std::ops::Deref for SecretBytes<N> {
+    type Target = [u8; N];
+
+    fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
@@ -103,7 +133,8 @@ pub struct AppConfig {
     pub cookie: CookieConfig,
     /// Maximum accepted request body size in bytes. Applied via
     /// `RequestBodyLimitLayer`; requests over this limit are rejected with a
-    /// 413 before reaching a handler. Defaults to 1MB.
+    /// 413 before reaching a handler. Defaults to 64KB, which covers every
+    /// current endpoint (the largest JSON bodies are a few hundred bytes).
     pub max_request_body_bytes: usize,
 }
 
@@ -306,6 +337,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn secret_bytes_debug_redacts_key_material() {
+        let key = SecretBytes::new([0xABu8; 32]);
+        let debug_str = format!("{:?}", key);
+        assert_eq!(debug_str, "[REDACTED]");
+        assert!(!debug_str.contains("171"));
+        assert!(!debug_str.to_lowercase().contains("ab"));
+        assert_eq!(key.expose(), &[0xABu8; 32]);
+    }
+
+    #[test]
     fn secret_string_debug_redacts_secret() {
         let secret = SecretString::new("my-secret-key".to_string());
         let debug_str = format!("{:?}", secret);
@@ -470,8 +511,8 @@ mod tests {
     }
 
     #[test]
-    fn max_request_body_bytes_defaults_to_one_megabyte() {
-        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 1024 * 1024);
+    fn max_request_body_bytes_defaults_to_64_kilobytes() {
+        assert_eq!(DEFAULT_MAX_REQUEST_BODY_BYTES, 64 * 1024);
     }
 
     // --- Secret minimum-length enforcement (issue #1099) ---

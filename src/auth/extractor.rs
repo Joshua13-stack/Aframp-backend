@@ -116,14 +116,21 @@ fn authenticate(parts: &Parts, state: &AppState) -> Result<Claims, (StatusCode, 
     Ok(claims)
 }
 
-/// Verifies the token and that its account still exists and hasn't been
-/// deleted, so deleting an account revokes every token issued for it.
+/// Verifies the token, that its account still exists and hasn't been
+/// deleted, and that the session began after the last password change — so
+/// deleting an account or changing its password revokes every token issued
+/// before that point. Refreshed tokens keep their original `orig_iat`, so a
+/// refresh can't launder a session past a password change.
 async fn authenticate_active(
     parts: &Parts,
     state: &AppState,
 ) -> Result<Claims, (StatusCode, Json<ApiError>)> {
     let claims = authenticate(parts, state)?;
-    if !users::is_active(&state.db, claims.sub).await.map_err(internal)? {
+    let session_start = if claims.orig_iat == 0 { claims.iat } else { claims.orig_iat } as i64;
+    if !users::session_is_valid(&state.db, claims.sub, session_start)
+        .await
+        .map_err(internal)?
+    {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ApiError { code: ErrorCode::InvalidCredentials, error: "invalid or expired token".into(), field: None }),
