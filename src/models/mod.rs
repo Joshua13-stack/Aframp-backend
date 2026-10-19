@@ -16,7 +16,9 @@ pub use admin::{
 pub use api_key::ApiKey;
 pub use otp::{OtpChallenge, OtpChallengeResponse, VerifyOtpRequest};
 pub use balance::{Balance, UpdateBalance};
-pub use merchant::{Merchant, NewMerchant};
+pub use merchant::{
+    AdminKycDecisionRequest, KycStatus, Merchant, NewMerchant, SubmitKycRequest,
+};
 pub use payment::{NewPayment, Payment, UpdatePaymentStatus};
 pub use payment_request::{CreatePaymentRequestRequest, PaymentRequest};
 pub use user::{AuthResponse, LoginRequest, NewUser, SignupRequest, User};

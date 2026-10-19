@@ -1,13 +1,13 @@
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::response::Html;
 use axum::Json;
 use serde::Deserialize;
 
 use crate::auth::extractor::AdminUser;
-use crate::error::{internal, ApiResult};
+use crate::error::{internal, ApiError, ApiResult};
 use crate::models::{
-    AdminMerchantRow, AdminOverview, AdminPaymentRequestRow, AdminTransactionRow, AdminUserRow,
-    AdminWalletRow, AdminWithdrawalRow,
+    AdminKycDecisionRequest, AdminMerchantRow, AdminOverview, AdminPaymentRequestRow,
+    AdminTransactionRow, AdminUserRow, AdminWalletRow, AdminWithdrawalRow,
 };
 use crate::services::admin;
 use crate::AppState;
@@ -45,6 +45,27 @@ pub async fn merchants(
 ) -> ApiResult<Json<Vec<AdminMerchantRow>>> {
     let rows = admin::merchants(&state.db, limit(&params)).await.map_err(internal)?;
     Ok(Json(rows))
+}
+
+pub async fn set_merchant_kyc(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<i64>,
+    Json(payload): Json<AdminKycDecisionRequest>,
+) -> ApiResult<Json<AdminMerchantRow>> {
+    let status = payload.status.trim().to_ascii_lowercase();
+    if status != "verified" && status != "rejected" {
+        return Err(ApiError::BadRequest(
+            "status must be either 'verified' or 'rejected'".to_string(),
+        ));
+    }
+
+    let row = admin::set_merchant_kyc(&state.db, id, &status)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::NotFound("merchant not found".to_string()))?;
+
+    Ok(Json(row))
 }
 
 pub async fn wallets(

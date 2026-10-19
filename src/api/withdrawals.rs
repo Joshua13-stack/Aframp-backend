@@ -3,7 +3,9 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::auth::extractor::AuthUser;
-use crate::error::{bad_gateway, bad_request, bad_request_field, internal, ApiResult, ErrorCode};
+use crate::error::{
+    bad_gateway, bad_request, bad_request_field, forbidden, internal, ApiResult, ErrorCode,
+};
 use crate::models::{CreateWithdrawalRequest, NewWithdrawal, Withdrawal};
 use crate::pagination::{Cursor, Page};
 use crate::services::withdrawals::{self, WithdrawalError};
@@ -90,6 +92,10 @@ fn map_withdrawal_error(err: WithdrawalError) -> (axum::http::StatusCode, Json<c
         WithdrawalError::InvalidAmountPrecision => bad_request(
             ErrorCode::InvalidAmount,
             "amount_stroops must be a whole number of kobo",
+        ),
+        WithdrawalError::KycRequired => forbidden(
+            ErrorCode::KycRequired,
+            "merchant KYC verification required before withdrawals",
         ),
         WithdrawalError::PayoutFailed(msg) => bad_gateway(ErrorCode::PayoutFailed, &msg),
         WithdrawalError::Database(e) => internal(e),
