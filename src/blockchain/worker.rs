@@ -3,12 +3,10 @@ use std::time::Duration;
 
 use sqlx::PgPool;
 
+use crate::blockchain::error::BlockchainError;
 use crate::blockchain::stellar::{BlockchainListener, StellarListener};
-use crate::models::{NewPayment, UpdatePaymentStatus};
-use crate::services::{balances, payment_requests, payments, wallets};
-use crate::blockchain::stellar::{BlockchainListener, DetectedDeposit, StellarListener};
 use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus};
-use crate::services::{balances, notifications, payment_requests, payments, wallets};
+use crate::services::{balances, payment_requests, payments, wallets};
 use crate::AppState;
 
 pub async fn run(state: Arc<AppState>, horizon_url: String, poll_interval_secs: u64) {
@@ -16,36 +14,36 @@ pub async fn run(state: Arc<AppState>, horizon_url: String, poll_interval_secs: 
 
     loop {
         if let Err(err) = poll_once(&state.db, &listener).await {
-            tracing::warn!(error = %err, "deposit poll failed");
+            log_blockchain_error(&err, "deposit poll failed");
         }
         tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
     }
 }
 
-// Wallets are processed in keyset-paginated batches of `WALLET_BATCH_SIZE`
-// (500) to avoid materializing every Stellar wallet in memory each poll cycle.
-// Each batch issues one Horizon request for up to 500 addresses; the loop
-// continues until a batch returns fewer than `WALLET_BATCH_SIZE` rows, so the
-// expected scale limit is bounded by the number of batches rather than the
-// total wallet count.
-const WALLET_BATCH_SIZE: i64 = 500;
-
-async fn poll_once(db: &PgPool, listener: &StellarListener) -> Result<(), String> {
-    let mut after_id: Option<i64> = None;
-    let skip = listener.skipped_addresses();
-    let addresses: Vec<String> = wallets::pollable_wallets(db, &skip)
-pub async fn poll_once(db: &PgPool, listener: &StellarListener) -> Result<(), String> {
-/// Polls the blockchain listener once and processes any detected deposits.
+/// Log a `BlockchainError` at the appropriate severity level:
 ///
-/// Generic over [`BlockchainListener`] so tests can inject a mock listener
-/// (e.g. to simulate a fake deposit) without hitting a real chain.
-pub async fn poll_once<L: BlockchainListener>(
+/// - `HttpError`     → `warn`  (transient network issue; next cycle will retry)
+/// - `ParseError`    → `error` (bad data from Horizon; retrying won't help)
+/// - `DatabaseError` → `error` (platform storage problem; needs attention)
+/// - `NotFound`      → `warn`  (can occur transiently during wallet creation)
+fn log_blockchain_error(err: &BlockchainError, context: &str) {
+    match err {
+        BlockchainError::HttpError(_) | BlockchainError::NotFound(_) => {
+            tracing::warn!(error = %err, "{context}");
+        }
+        BlockchainError::ParseError(_) | BlockchainError::DatabaseError(_) => {
+            tracing::error!(error = %err, "{context}");
+        }
+    }
+}
+
+async fn poll_once(
     db: &PgPool,
-    listener: &L,
-) -> Result<(), String> {
+    listener: &StellarListener,
+) -> Result<(), BlockchainError> {
     let addresses: Vec<String> = wallets::all_wallets(db)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?
         .into_iter()
         .map(|w| w.address)
         .collect();
@@ -53,34 +51,22 @@ pub async fn poll_once<L: BlockchainListener>(
         return Ok(());
     }
 
-    loop {
-        let batch = wallets::all_wallets_page(db, after_id, WALLET_BATCH_SIZE)
-            .await
-            .map_err(|e| e.to_string())?;
-        if batch.is_empty() {
-            break;
+    let deposits = listener.fetch_deposits(&addresses).await?;
+    for deposit in deposits {
+        if let Err(err) = process_deposit(db, deposit).await {
+            log_blockchain_error(&err, "failed to process deposit");
         }
-
-        let batch_len = batch.len() as i64;
-        let last_id = batch.last().map(|w| w.id);
-
-        let addresses: Vec<String> = batch.into_iter().map(|w| w.address).collect();
-        let deposits = listener.fetch_deposits(&addresses).await?;
-        for deposit in deposits {
-            if let Err(err) = process_deposit(db, deposit).await {
-                tracing::warn!(error = %err, "failed to process deposit");
-            }
-        }
-
-        if batch_len < WALLET_BATCH_SIZE {
-            break;
-        }
-        after_id = last_id;
     }
-
     Ok(())
 }
 
+async fn process_deposit(
+    db: &PgPool,
+    d: crate::blockchain::stellar::DetectedDeposit,
+) -> Result<(), BlockchainError> {
+    let Some(wallet) = wallets::wallet_by_address(db, &d.destination)
+        .await
+        .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?
 /// Returns true only when the deposit's destination is exactly the address of
 /// the wallet that would be credited.
 pub fn destination_matches_wallet(wallet_address: &str, destination: &str) -> bool {
@@ -107,7 +93,7 @@ pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), Stri
     }
     let memo = d.memo.clone();
 
-    let (payment, inserted) = payments::record_deposit(
+    let payment = payments::record_deposit(
         db,
         NewPayment {
             merchant_id: wallet.merchant_id,
@@ -120,67 +106,53 @@ pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), Stri
         },
     )
     .await
-    .map_err(|e| e.to_string())?;
-
-    // Idempotency guard: if the payment row already existed, a previous poll
-    // cycle has already (or is in the process of) crediting the balance. Never
-    // mutate balances for an existing row, otherwise a crash between
-    // `record_deposit` and `set_status(Verified)` would double-credit the
-    // pending balance on every subsequent poll cycle.
-    if !inserted {
-        return Ok(());
-    }
+    .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?;
 
     if payment.status != "detected" {
-    if payment.status != crate::models::status::PaymentStatus::Detected {
         return Ok(());
     }
 
     payments::set_status(db, payment.id, UpdatePaymentStatus::Verified)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?;
 
-    // Confirmation is immediate today, so credit the balance directly in a single
-    // UPSERT instead of the previous pending → available two-step (two round-trips).
-    // TODO: once the Stellar confirmation depth feature lands, split this back into
-    // two steps: credit `pending` here, then move pending → available after the
-    // confirmations threshold is reached.
-    balances::apply_delta(
-        db,
-        &crate::models::UpdateBalance {
-            merchant_id: wallet.merchant_id,
-            asset: d.asset.clone(),
-            available_delta: d.amount_stroops,
-            pending_delta: 0,
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    payments::set_status(db, payment.id, UpdatePaymentStatus::Confirmed)
-        .await
-        .map_err(|e| e.to_string())?;
     balances::apply_delta(
         db,
         &UpdateBalance {
             merchant_id: wallet.merchant_id,
             asset: d.asset.clone(),
+            available_delta: 0,
+            pending_delta: d.amount_stroops,
+        },
+    )
+    .await
+    .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?;
+
+    // TODO: move pending → available after Stellar confirmations threshold.
+    payments::set_status(db, payment.id, UpdatePaymentStatus::Confirmed)
+        .await
+        .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?;
+    balances::apply_delta(
+        db,
+        &UpdateBalance {
+            merchant_id: wallet.merchant_id,
+            asset: d.asset,
             available_delta: d.amount_stroops,
             pending_delta: -d.amount_stroops,
         },
     )
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?;
 
     if let Some(memo) = memo {
         if let Some(pr) = payment_requests::find_pending_by_wallet_and_memo(db, wallet.id, &memo)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?
         {
             if payment.amount_stroops >= pr.amount_stroops {
                 payment_requests::mark_paid(db, pr.id, payment.id)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?;
             } else {
                 tracing::warn!(
                     expected = pr.amount_stroops,
@@ -190,26 +162,9 @@ pub async fn process_deposit(db: &PgPool, d: DetectedDeposit) -> Result<(), Stri
                 );
                 payment_requests::mark_partial(db, pr.id, payment.id)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?;
             }
         }
-    }
-
-    // Notify the merchant that the deposit has been confirmed. Notifications are
-    // opt-in via the merchant preference setting; the service is a no-op when the
-    // merchant has not enabled them. Failures are logged and never block deposit
-    // processing.
-    if let Err(err) = notifications::notify_deposit_confirmed(
-        db,
-        wallet.merchant_id,
-        payment.id,
-        d.amount_stroops,
-        &d.asset,
-        &d.tx_hash,
-    )
-    .await
-    {
-        tracing::warn!(error = %err, payment_id = %payment.id, "failed to send deposit notification");
     }
 
     // TODO: dispatch payment.confirmed webhook.

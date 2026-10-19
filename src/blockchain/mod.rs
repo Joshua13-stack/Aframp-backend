@@ -1,3 +1,4 @@
+pub mod error;
 pub mod deposit_parser;
 pub mod horizon;
 pub mod keypair;
