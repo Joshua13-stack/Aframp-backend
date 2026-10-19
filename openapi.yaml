@@ -89,6 +89,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429':
           description: >
@@ -124,6 +125,7 @@ paths:
                 oneOf:
                   - $ref: '#/components/schemas/OtpChallengeResponse'
                   - $ref: '#/components/schemas/AuthResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
         '401':
           description: >
             INVALID_CREDENTIALS — wrong password or unknown email, deliberately
@@ -131,6 +133,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429':
           description: >
@@ -181,6 +184,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '429':
           description: TOO_MANY_REQUESTS — OTP verification rate limit hit.
@@ -228,6 +232,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/AuthResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /me:
     get:
@@ -254,8 +259,6 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
         '500': { $ref: '#/components/responses/InternalError' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '404': { $ref: '#/components/responses/NotFound' }
     patch:
       tags: [Auth]
       summary: Update the signed-in user's name and/or phone number
@@ -298,6 +301,8 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '500': { $ref: '#/components/responses/InternalError' }
     delete:
       tags: [Auth]
       summary: Delete the signed-in account (right to erasure)
@@ -314,6 +319,7 @@ paths:
               schema: { type: string }
               description: aframp_session with Max-Age=0
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /wallet/create:
     post:
@@ -347,6 +353,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /wallet:
@@ -359,17 +366,14 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Wallet' }
-        '400':
-          description: >
-            WALLET_NOT_FOUND — no wallet created yet, run onboarding. Also
-            MERCHANT_NOT_FOUND for an account with no merchant.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-        '401':
-          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
         '404':
-          description: No wallet created yet — run onboarding
+          description: WALLET_NOT_FOUND — no wallet created yet, run onboarding.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
@@ -406,13 +410,17 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '403':
+          description: FORBIDDEN — merchant account is suspended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
         '404':
           description: Wallet not found for this merchant
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
     get:
@@ -428,20 +436,6 @@ paths:
           content:
             application/json:
               schema:
-                type: array
-                items: { $ref: '#/components/schemas/PaymentRequest' }
-        '400':
-          description: >
-            INVALID_PARAMETERS — limit is not an integer, or MERCHANT_NOT_FOUND.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ApiError' }
-        '401':
-          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ApiError' }
-        '500': { $ref: '#/components/responses/InternalError' }
                 type: object
                 required: [data, next_cursor]
                 properties:
@@ -452,8 +446,13 @@ paths:
                     type: string
                     nullable: true
                     description: Pass as `cursor` to fetch the next page; null on the last page.
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400':
+          description: INVALID_PARAMETERS (invalid limit or cursor) or MERCHANT_NOT_FOUND.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /payment-requests/{id}:
     get:
@@ -485,30 +484,6 @@ paths:
   /payment-requests/{id}/status:
     get:
       tags: [Payment requests]
-      summary: Poll a payment request's status (public)
-      description: >
-        Lightweight alternative to GET /payment-requests/{id} for high-frequency
-        polling: returns only the id, status, and paid_at, not the full request
-        object. Public, like the parent endpoint. 'expired' is computed at read
-        time from expires_at; a request that expires and is then paid still flips
-        to 'paid'.
-  /payment-requests/{id}/cancel:
-    post:
-      tags: [Payment requests]
-      summary: Cancel a pending payment request
-      description: >
-        Lets a merchant void a request they created by mistake (wrong amount or
-        asset) instead of waiting up to 24 hours for it to expire. Scoped to the
-        authenticated merchant — a request belonging to someone else is reported
-        as 404, not 403, so the endpoint cannot be used to probe for other
-        merchants' request ids. Only a request that is still pending can be
-        cancelled; once it has been paid, partially paid, or has expired, the
-        cancel is rejected with 409. Cancelling is idempotent in effect: a
-        request already in the cancelled state returns 409 like any other
-        non-pending status.
-  /payment-requests/{id}/status:
-    get:
-      tags: [Payment requests]
       summary: Poll payment-request status (public)
       description: >
         Lightweight status-only endpoint for customer-side polling after a QR
@@ -524,6 +499,31 @@ paths:
       responses:
         '200':
           description: Payment request status
+          headers:
+            Cache-Control:
+              schema: { type: string, example: 'public, max-age=5' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentRequestStatus' }
+        '404':
+          description: PAYMENT_REQUEST_NOT_FOUND — no request with that id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /payment-requests/{id}/cancel:
+    post:
+      tags: [Payment requests]
+      summary: Cancel a pending payment request
+      description: >
+        Lets a merchant void a request they created by mistake. Scoped to the
+        authenticated merchant; requests owned by another merchant are reported
+        as not found. Only a pending request can be cancelled.
+      parameters:
+        - name: id
+          in: path
+          required: true
           schema: { type: string, format: uuid }
       responses:
         '200':
@@ -533,25 +533,16 @@ paths:
               schema: { $ref: '#/components/schemas/PaymentRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404':
-          description: PAYMENT_REQUEST_NOT_FOUND — unknown id, or one owned by another merchant
+          description: PAYMENT_REQUEST_NOT_FOUND — unknown id, or one owned by another merchant.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
         '409':
-          description: >
-            The request is no longer pending — already paid, partially paid,
-            expired, or already cancelled
+          description: Request is not pending and cannot be cancelled.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
-          description: Status payload
-          headers:
-            Cache-Control:
-              schema: { type: string, example: 'public, max-age=5' }
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/PaymentRequestStatus' }
-        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /balance:
     get:
@@ -592,21 +583,6 @@ paths:
           content:
             application/json:
               schema:
-                type: array
-                items: { $ref: '#/components/schemas/Payment' }
-        '400':
-          description: >
-            INVALID_PARAMETERS (bad limit) or MERCHANT_NOT_FOUND — the account
-            has no merchant.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ApiError' }
-        '401':
-          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ApiError' }
-        '500': { $ref: '#/components/responses/InternalError' }
                 type: object
                 required: [data, next_cursor]
                 properties:
@@ -617,8 +593,13 @@ paths:
                     type: string
                     nullable: true
                     description: Pass as `cursor` to fetch the next page; null on the last page.
-        '400': { $ref: '#/components/responses/BadRequest' }
+        '400':
+          description: INVALID_PARAMETERS (invalid limit or cursor) or MERCHANT_NOT_FOUND.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /analytics:
     get:
@@ -682,6 +663,12 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '403':
+          description: FORBIDDEN — merchant account is suspended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedMediaType' }
         '500': { $ref: '#/components/responses/InternalError' }
         '502':
@@ -724,6 +711,7 @@ paths:
                     description: Pass as `cursor` to fetch the next page; null on the last page.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /webhooks/termii:
     post:
@@ -758,6 +746,9 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApiError' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /admin:
     get:
@@ -794,6 +785,7 @@ paths:
               schema: { $ref: '#/components/schemas/AdminOverview' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /admin/merchants:
     get:
@@ -814,6 +806,7 @@ paths:
                 items: { $ref: '#/components/schemas/AdminMerchantRow' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /admin/users:
     get:
@@ -834,6 +827,7 @@ paths:
                 items: { $ref: '#/components/schemas/AdminUserRow' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /admin/wallets:
     get:
@@ -854,6 +848,7 @@ paths:
                 items: { $ref: '#/components/schemas/AdminWalletRow' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /admin/transactions:
     get:
@@ -874,6 +869,7 @@ paths:
                 items: { $ref: '#/components/schemas/AdminTransactionRow' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /admin/withdrawals:
     get:
@@ -891,23 +887,10 @@ paths:
             application/json:
               schema:
                 type: array
-                items: { $ref: '#/components/schemas/Withdrawal' }
-        '400':
-          description: >
-            INVALID_PARAMETERS (bad limit) or MERCHANT_NOT_FOUND — the account
-            has no merchant.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ApiError' }
-        '401':
-          description: INVALID_CREDENTIALS — missing, malformed, or expired token.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/ApiError' }
-        '500': { $ref: '#/components/responses/InternalError' }
                 items: { $ref: '#/components/schemas/AdminWithdrawalRow' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /admin/payment-requests:
     get:
@@ -928,6 +911,7 @@ paths:
                 items: { $ref: '#/components/schemas/AdminPaymentRequestRow' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
 components:
   securitySchemes:
@@ -1015,6 +999,25 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ApiError' }
+          example:
+            error: content-type must be application/json
+            code: INVALID_PARAMETERS
+    PayloadTooLarge:
+      description: Request body exceeds the configured maximum size.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          example:
+            error: request body too large
+            code: PAYLOAD_TOO_LARGE
+    Conflict:
+      description: The request conflicts with the current resource state.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+          example:
+            error: email already registered
+            code: EMAIL_TAKEN
     InternalError:
       description: >
         INTERNAL_ERROR — an unexpected server-side failure. Always a 500, and the
@@ -1029,29 +1032,22 @@ components:
     ApiError:
       type: object
       required: [error, code]
+      example:
+        error: must be a valid email address
+        code: INVALID_PARAMETERS
+        field: email
       properties:
         error: { type: string, example: insufficient available balance }
         code:
           type: string
           example: INSUFFICIENT_BALANCE
           description: >
-            Machine-readable error code. The complete catalog of all 19 variants
-            (see the "Error Codes" section of API.md for HTTP statuses and the
-            endpoints that can return each one):
-
-
-            INVALID_PARAMETERS (400), INVALID_AMOUNT (400), INSUFFICIENT_BALANCE
-            (400), UNSUPPORTED_ASSET (400), PAYOUT_FAILED (502), EMAIL_TAKEN
-            (409), PHONE_TAKEN (409), INVALID_CREDENTIALS (401), USER_NOT_FOUND
-            (404), MERCHANT_NOT_FOUND (400), WALLET_NOT_FOUND (400),
-            PAYMENT_REQUEST_NOT_FOUND (404), FORBIDDEN (403), OTP_INVALID (400),
-            OTP_EXPIRED (400), OTP_LOCKED (400), OTP_CHALLENGE_NOT_FOUND (404),
-            TOO_MANY_REQUESTS (429), INTERNAL_ERROR (500).
+            Stable machine-readable code. Match on this field, not the human
+            message. See API.md for endpoint-specific codes and HTTP statuses.
 
 
             INTERNAL_ERROR is always returned with HTTP 500 and a generic, safe
-            `error` message — it never exposes internal details.
-          description: Machine-readable error code. Match on this field, never on `error`.
+            `error` message; it never exposes internal details.
           enum:
             - INVALID_PARAMETERS
             - INVALID_AMOUNT
@@ -1071,7 +1067,12 @@ components:
             - OTP_LOCKED
             - OTP_CHALLENGE_NOT_FOUND
             - TOO_MANY_REQUESTS
+            - PAYLOAD_TOO_LARGE
             - INTERNAL_ERROR
+        field:
+          type: string
+          description: Present only for field-level validation errors.
+          example: email
 
     SignupRequest:
       type: object
@@ -1081,6 +1082,7 @@ components:
         email:
           type: string
           format: email
+          maxLength: 254
           description: Account email. Must be unique among verified accounts.
         password:
           type: string
@@ -1089,11 +1091,8 @@ components:
         name:
           type: string
           minLength: 1
+          maxLength: 100
           description: Display name for the user and merchant.
-          maxLength: 254
-          description: RFC 5321 max length 254; local-part ≤ 64, domain ≤ 255.
-        password: { type: string, minLength: 8 }
-        name: { type: string, minLength: 1, maxLength: 100 }
         phone_number:
           type: string
           maxLength: 20
@@ -1249,22 +1248,6 @@ components:
             SEP-0007 payment URI to render as a QR code. Null for non-XLM assets —
             no cNGN issuer address is configured, and a guessed one would misdirect funds.
           example: web+stellar:pay?destination=GDDT...&amount=2.5000000&memo=1f97c93409172a7d&memo_type=MEMO_TEXT
-
-    PaymentRequestStatus:
-      type: object
-      required: [status]
-      properties:
-        status:
-          type: string
-          enum: [pending, paid, expired]
-          description: >
-            Same effective_status as GET /payment-requests/{id} — overdue
-            pending rows report as expired at read time.
-        paid_at:
-          type: string
-          format: date-time
-          nullable: true
-          description: Present when status is paid (row updated_at at mark-paid).
 
     Balance:
       type: object
