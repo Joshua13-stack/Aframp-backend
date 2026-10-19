@@ -134,6 +134,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/login", axum::routing::post(api::auth::login))
         .route("/verify-otp", axum::routing::post(api::auth::verify_otp))
         .route("/logout", axum::routing::post(api::auth::logout))
+        .route("/auth/change-password", axum::routing::post(api::auth::change_password))
         .route("/webhooks/termii", axum::routing::post(api::webhooks::termii))
         .route("/me", axum::routing::get(api::me::get))
         .route("/wallet/create", axum::routing::post(api::wallets::create))
@@ -230,6 +231,7 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/login", axum::routing::post(api::auth::login))
         .route("/verify-otp", axum::routing::post(api::auth::verify_otp))
         .route("/logout", axum::routing::post(api::auth::logout))
+        .route("/auth/change-password", axum::routing::post(api::auth::change_password))
         .route("/auth/refresh", axum::routing::post(api::auth::refresh))
         .route("/webhooks/termii", axum::routing::post(api::webhooks::termii))
         .route(

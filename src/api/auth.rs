@@ -15,7 +15,7 @@ use crate::error::{
     bad_request, bad_request_field, internal,
     ApiResult,
 };
-use crate::models::{AuthResponse, LoginRequest, OtpChallengeResponse, SignupRequest, VerifyOtpRequest};
+use crate::models::{AuthResponse, ChangePasswordRequest, LoginRequest, OtpChallengeResponse, SignupRequest, VerifyOtpRequest};
 use crate::services::otp::{self, VerifiedOutcome};
 use crate::services::users;
 use crate::validation::{is_valid_email, normalize_ng_phone_number, validate_name};
@@ -202,6 +202,44 @@ pub async fn refresh(State(state): State<AppState>, Session(claims): Session) ->
         jwt::RefreshError::Signing => internal(err),
         _ => unauthorized(ErrorCode::InvalidCredentials, &err.to_string()),
     })?;
+    authenticated(
+        &state,
+        AuthResponse {
+            token,
+            user_id: claims.sub,
+            merchant_id: claims.merchant_id,
+        },
+    )
+}
+
+/// Changes the signed-in user's password. The current password must be
+/// re-proven even with a valid session, so a hijacked token alone can't lock
+/// the owner out. Every session issued before the change stops working; the
+/// caller gets a fresh session (body + cookie) so this device stays signed in.
+pub async fn change_password(
+    State(state): State<AppState>,
+    Session(claims): Session,
+    Json(req): Json<ChangePasswordRequest>,
+) -> ApiResult<impl IntoResponse> {
+    if req.new_password.len() < 8 {
+        return Err(bad_request_field(
+            "new_password",
+            "must be at least 8 characters",
+        ));
+    }
+
+    users::change_password(&state.db, claims.sub, &req.current_password, &req.new_password)
+        .await
+        .map_err(|err| match err {
+            users::ChangePasswordError::WrongCurrentPassword => bad_request_field(
+                "current_password",
+                "current password is incorrect",
+            ),
+            users::ChangePasswordError::Hash | users::ChangePasswordError::Database(_) => internal(err),
+        })?;
+
+    let token = jwt::sign(&state.jwt_secret, claims.sub, claims.merchant_id, claims.is_admin)
+        .map_err(internal)?;
     authenticated(
         &state,
         AuthResponse {
