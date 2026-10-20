@@ -40,6 +40,7 @@ fn hmac_sha512_hex(key: &str, body: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+use common::{assert_no_sensitive_fields_json, send, state};
 /// POSTs raw bytes to the Termii webhook, with an optional signature header.
 async fn post_termii(app: &axum::Router, signature: Option<&str>, body: Vec<u8>) -> (StatusCode, Value) {
     let mut builder = Request::builder()

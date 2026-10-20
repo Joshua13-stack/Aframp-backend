@@ -280,3 +280,53 @@ pub fn extract_otp_code(message: &str) -> String {
         .expect("message should contain a 6-digit code")
         .to_string()
 }
+
+/// Substrings that must never appear in any API response body. `password_hash`
+/// is the serialized field name; `argon2` is the hashing algorithm prefix that
+/// would leak if a hash were ever embedded in a response.
+pub const SENSITIVE_MARKERS: [&str; 2] = ["password_hash", "argon2"];
+
+/// Authenticated `GET` endpoints that return user-scoped data. New endpoints
+/// should be added here so [`assert_authenticated_endpoints_clean`] covers them
+/// automatically.
+pub const AUTHENTICATED_GET_ENDPOINTS: [&str; 6] = [
+    "/me",
+    "/wallet",
+    "/balance",
+    "/transactions",
+    "/payment-requests",
+    "/withdrawals",
+];
+
+/// Panics if `body` contains any of [`SENSITIVE_MARKERS`].
+pub fn assert_no_sensitive_fields(body: &str) {
+    for marker in SENSITIVE_MARKERS {
+        assert!(
+            !body.contains(marker),
+            "response body leaked sensitive marker {marker:?}: {body}"
+        );
+    }
+}
+
+/// Panics if the serialized form of `value` contains any sensitive marker.
+pub fn assert_no_sensitive_fields_json(value: &serde_json::Value) {
+    assert_no_sensitive_fields(&value.to_string());
+}
+
+/// Calls every endpoint in [`AUTHENTICATED_GET_ENDPOINTS`] with `token` and
+/// asserts none of the responses leak sensitive fields. Endpoints that are not
+/// available in the current build (404/405) are skipped; any other non-success
+/// status is surfaced so the check cannot silently pass on a broken route.
+pub async fn assert_authenticated_endpoints_clean(app: &Router, token: &str) {
+    for uri in AUTHENTICATED_GET_ENDPOINTS {
+        let (status, json) = send(app.clone(), "GET", uri, Some(token), None).await;
+        if status == StatusCode::NOT_FOUND || status == StatusCode::METHOD_NOT_ALLOWED {
+            continue;
+        }
+        assert!(
+            status.is_success(),
+            "GET {uri} returned {status}: {json}"
+        );
+        assert_no_sensitive_fields_json(&json);
+    }
+}

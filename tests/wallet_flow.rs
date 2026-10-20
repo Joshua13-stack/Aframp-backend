@@ -3,7 +3,10 @@ mod common;
 use axum::http::StatusCode;
 use serde_json::json;
 
-use common::{ensure_merchant, send, state};
+use common::{
+    assert_authenticated_endpoints_clean, assert_no_sensitive_fields_json, ensure_merchant, send,
+    state,
+};
 
 async fn app() -> axum::Router {
     aframp::router(state().await)
@@ -50,6 +53,9 @@ async fn create_and_fetch_wallet() {
     let (status, json) = send(app.clone(), "GET", "/wallet", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK, "get wallet failed: {json}");
     assert_eq!(json["address"], address);
+    assert_no_sensitive_fields_json(&json, "GET /wallet");
+
+    assert_authenticated_endpoints_clean(&app, &token).await;
 }
 
 #[tokio::test]
@@ -74,10 +80,12 @@ async fn balance_and_transactions_start_empty() {
     let (status, json) = send(app.clone(), "GET", "/balance", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK, "balance failed: {json}");
     assert_eq!(json, json!([]));
+    assert_no_sensitive_fields_json(&json, "GET /balance");
 
     let (status, json) = send(app.clone(), "GET", "/transactions", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK, "transactions failed: {json}");
     assert_eq!(json, json!([]));
+    assert_no_sensitive_fields_json(&json, "GET /transactions");
 }
 
 #[tokio::test]

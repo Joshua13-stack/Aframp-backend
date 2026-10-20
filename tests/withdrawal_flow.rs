@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axum::http::StatusCode;
 use serde_json::json;
 
-use common::{ensure_merchant, send, state};
+use common::{assert_no_sensitive_fields_json, ensure_merchant, send, state};
 
 /// Seeds a cNGN balance row directly into the DB for the given merchant.
 async fn seed_balance(state: &aframp::AppState, merchant_id: &str, available: i64) {
@@ -265,6 +265,8 @@ async fn withdrawal_success_decrements_balance() {
 
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
+    assert_eq!(json.as_array().unwrap().len(), 1);
     let withdrawals = json["data"].as_array().unwrap();
     assert_eq!(withdrawals.len(), 1);
     assert_eq!(withdrawals[0]["account_number"], "****6789");
@@ -554,6 +556,7 @@ async fn withdrawal_paystack_otp_status_maps_to_processing() {
     // tripping the CHECK constraint.
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
     let withdrawals = json.as_array().unwrap();
     assert_eq!(withdrawals.len(), 1);
     assert_eq!(
@@ -689,6 +692,8 @@ async fn withdrawal_invalid_bank_code_refunds_balance_and_records_reason() {
 
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
+    let withdrawals = json.as_array().unwrap();
     let withdrawals = json["data"].as_array().unwrap();
     assert_eq!(withdrawals[0]["status"], "failed");
     assert_eq!(withdrawals[0]["failure_reason"], "Invalid bank code");
@@ -744,6 +749,8 @@ async fn withdrawal_invalid_account_number_refunds_balance_and_records_reason() 
 
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
+    let withdrawals = json.as_array().unwrap();
     let withdrawals = json["data"].as_array().unwrap();
     assert_eq!(withdrawals[0]["status"], "failed");
     assert_eq!(
@@ -883,6 +890,8 @@ async fn withdrawal_paystack_timeout_refunds_balance_and_records_reason() {
 
     let (status, json) = send(app.clone(), "GET", "/withdrawals", Some(&token), None).await;
     assert_eq!(status, StatusCode::OK);
+    assert_no_sensitive_fields_json(&json);
+    let withdrawals = json.as_array().unwrap();
     let withdrawals = json["data"].as_array().unwrap();
     assert_eq!(withdrawals[0]["status"], "failed");
     assert_eq!(
