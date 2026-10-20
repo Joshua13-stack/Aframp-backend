@@ -214,6 +214,7 @@ pub async fn wallet_by_address(db: &PgPool, address: &str) -> Result<Option<Wall
     .fetch_optional(db)
     .await
 }
+}
 
 #[cfg(test)]
 mod tests {

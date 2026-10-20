@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,7 +6,7 @@ use sqlx::PgPool;
 
 use crate::blockchain::error::BlockchainError;
 use crate::blockchain::stellar::{BlockchainListener, StellarListener};
-use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus};
+use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus, Wallet};
 use crate::services::{balances, payment_requests, payments, wallets};
 use crate::AppState;
 
@@ -20,6 +21,8 @@ pub async fn run(state: Arc<AppState>, horizon_url: String, poll_interval_secs: 
     }
 }
 
+async fn poll_once(db: &PgPool, listener: &StellarListener) -> Result<(), String> {
+    let wallets_by_address: HashMap<String, Wallet> = wallets::all_wallets(db)
 /// Log a `BlockchainError` at the appropriate severity level:
 ///
 /// - `HttpError`     → `warn`  (transient network issue; next cycle will retry)
@@ -45,14 +48,17 @@ async fn poll_once(
         .await
         .map_err(|e| BlockchainError::DatabaseError(e.to_string()))?
         .into_iter()
-        .map(|w| w.address)
+        .map(|w| (w.address.clone(), w))
         .collect();
-    if addresses.is_empty() {
+    if wallets_by_address.is_empty() {
         return Ok(());
     }
+    let addresses: Vec<String> = wallets_by_address.keys().cloned().collect();
 
     let deposits = listener.fetch_deposits(&addresses).await?;
     for deposit in deposits {
+        if let Err(err) = process_deposit(db, &wallets_by_address, deposit).await {
+            tracing::warn!(error = %err, "failed to process deposit");
         if let Err(err) = process_deposit(db, deposit).await {
             log_blockchain_error(&err, "failed to process deposit");
         }
@@ -60,6 +66,13 @@ async fn poll_once(
     Ok(())
 }
 
+async fn process_deposit(
+    db: &PgPool,
+    wallets_by_address: &HashMap<String, Wallet>,
+    d: crate::blockchain::stellar::DetectedDeposit,
+) -> Result<(), String> {
+    let Some(wallet) = wallets_by_address.get(&d.destination).cloned() else {
+        tracing::warn!(address = %d.destination, "deposit for unknown wallet");
 /// Returns true only when the deposit's destination is exactly the address of
 /// the wallet that would be credited.
 pub fn destination_matches_wallet(wallet_address: &str, destination: &str) -> bool {
