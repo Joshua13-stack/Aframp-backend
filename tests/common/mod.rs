@@ -163,6 +163,23 @@ pub async fn ensure_merchant(app: &Router, seed: &str) -> (String, String) {
     )
 }
 
+/// Asserts that a response body never leaks password material. Serializes
+/// the body back to a string and panics if it contains `password_hash` or
+/// `argon2` anywhere. Call this on every authenticated endpoint's response
+/// so new endpoints are covered automatically.
+pub fn assert_no_secret_leak(body: &Value) {
+    let serialized = serde_json::to_string(body).unwrap_or_default();
+    let lowered = serialized.to_ascii_lowercase();
+    assert!(
+        !lowered.contains("password_hash"),
+        "response body leaked password_hash: {serialized}"
+    );
+    assert!(
+        !lowered.contains("argon2"),
+        "response body leaked argon2 hash material: {serialized}"
+    );
+}
+
 /// Pulls the 6-digit code out of a mock-provider message body, ignoring
 /// surrounding punctuation (e.g. the trailing period after the code).
 pub fn extract_otp_code(message: &str) -> String {

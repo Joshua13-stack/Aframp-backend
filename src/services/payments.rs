@@ -3,6 +3,11 @@ use uuid::Uuid;
 
 use crate::models::{NewPayment, Payment, UpdatePaymentStatus};
 
+/// Full column list for the `payments` table, shared by every query that
+/// selects or returns a complete row.
+const PAYMENT_COLUMNS: &str = "id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset, \
+     network, status, confirmations, created_at, updated_at";
+
 #[derive(Debug, thiserror::Error)]
 pub enum PaymentError {
     #[error("wallet not found")]
@@ -12,12 +17,11 @@ pub enum PaymentError {
 }
 
 pub async fn record_deposit(db: &PgPool, payment: NewPayment) -> Result<Payment, PaymentError> {
-    let existing = sqlx::query_as::<_, Payment>(
-        "SELECT id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
-                network, status, confirmations, created_at, updated_at
+    let existing = sqlx::query_as::<_, Payment>(&format!(
+        "SELECT {PAYMENT_COLUMNS}
            FROM payments
-          WHERE tx_hash = $1",
-    )
+          WHERE tx_hash = $1"
+    ))
     .bind(&payment.tx_hash)
     .fetch_optional(db)
     .await?;
@@ -26,14 +30,13 @@ pub async fn record_deposit(db: &PgPool, payment: NewPayment) -> Result<Payment,
         return Ok(p);
     }
 
-    sqlx::query_as::<_, Payment>(
+    sqlx::query_as::<_, Payment>(&format!(
         "INSERT INTO payments (
              merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset, network, status
          )
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'detected')
-         RETURNING id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
-                   network, status, confirmations, created_at, updated_at",
-    )
+         RETURNING {PAYMENT_COLUMNS}"
+    ))
     .bind(payment.merchant_id)
     .bind(payment.wallet_id)
     .bind(&payment.wallet_address)
@@ -56,13 +59,12 @@ pub async fn set_status(
         UpdatePaymentStatus::Confirmed => "confirmed",
         UpdatePaymentStatus::Failed => "failed",
     };
-    sqlx::query_as::<_, Payment>(
+    sqlx::query_as::<_, Payment>(&format!(
         "UPDATE payments
             SET status = $2, updated_at = now()
           WHERE id = $1
-          RETURNING id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
-                    network, status, confirmations, created_at, updated_at",
-    )
+          RETURNING {PAYMENT_COLUMNS}"
+    ))
     .bind(id)
     .bind(status)
     .fetch_optional(db)
@@ -74,14 +76,13 @@ pub async fn payments_by_merchant(
     merchant_id: Uuid,
     limit: i64,
 ) -> Result<Vec<Payment>, sqlx::Error> {
-    sqlx::query_as::<_, Payment>(
-        "SELECT id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
-                network, status, confirmations, created_at, updated_at
+    sqlx::query_as::<_, Payment>(&format!(
+        "SELECT {PAYMENT_COLUMNS}
            FROM payments
           WHERE merchant_id = $1
           ORDER BY created_at DESC
-          LIMIT $2",
-    )
+          LIMIT $2"
+    ))
     .bind(merchant_id)
     .bind(limit)
     .fetch_all(db)
@@ -99,15 +100,14 @@ pub async fn payments_by_merchant_cursor(
 ) -> Result<Vec<Payment>, sqlx::Error> {
     match cursor {
         Some(c) => {
-            sqlx::query_as::<_, Payment>(
-                "SELECT id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
-                        network, status, confirmations, created_at, updated_at
+            sqlx::query_as::<_, Payment>(&format!(
+                "SELECT {PAYMENT_COLUMNS}
                    FROM payments
                   WHERE merchant_id = $1
                     AND (created_at, id) < ($2, $3)
                   ORDER BY created_at DESC, id DESC
-                  LIMIT $4",
-            )
+                  LIMIT $4"
+            ))
             .bind(merchant_id)
             .bind(c.created_at)
             .bind(c.id)
@@ -116,14 +116,13 @@ pub async fn payments_by_merchant_cursor(
             .await
         }
         None => {
-            sqlx::query_as::<_, Payment>(
-                "SELECT id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
-                        network, status, confirmations, created_at, updated_at
+            sqlx::query_as::<_, Payment>(&format!(
+                "SELECT {PAYMENT_COLUMNS}
                    FROM payments
                   WHERE merchant_id = $1
                   ORDER BY created_at DESC, id DESC
-                  LIMIT $2",
-            )
+                  LIMIT $2"
+            ))
             .bind(merchant_id)
             .bind(limit + 1)
             .fetch_all(db)
@@ -133,12 +132,11 @@ pub async fn payments_by_merchant_cursor(
 }
 
 pub async fn payment_by_id(db: &PgPool, id: Uuid) -> Result<Option<Payment>, sqlx::Error> {
-    sqlx::query_as::<_, Payment>(
-        "SELECT id, merchant_id, wallet_id, wallet_address, tx_hash, amount_stroops, asset,
-                network, status, confirmations, created_at, updated_at
+    sqlx::query_as::<_, Payment>(&format!(
+        "SELECT {PAYMENT_COLUMNS}
            FROM payments
-          WHERE id = $1",
-    )
+          WHERE id = $1"
+    ))
     .bind(id)
     .fetch_optional(db)
     .await

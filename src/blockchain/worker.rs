@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
 
 use crate::blockchain::stellar::{BlockchainListener, StellarListener};
-use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus};
+use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus, Wallet};
 use crate::services::{balances, payment_requests, payments, wallets};
 use crate::AppState;
 
@@ -20,28 +21,32 @@ pub async fn run(state: Arc<AppState>, horizon_url: String, poll_interval_secs: 
 }
 
 async fn poll_once(db: &PgPool, listener: &StellarListener) -> Result<(), String> {
-    let addresses: Vec<String> = wallets::all_wallets(db)
+    let wallets_by_address: HashMap<String, Wallet> = wallets::all_wallets(db)
         .await
         .map_err(|e| e.to_string())?
         .into_iter()
-        .map(|w| w.address)
+        .map(|w| (w.address.clone(), w))
         .collect();
-    if addresses.is_empty() {
+    if wallets_by_address.is_empty() {
         return Ok(());
     }
 
+    let addresses: Vec<String> = wallets_by_address.keys().cloned().collect();
     let deposits = listener.fetch_deposits(&addresses).await?;
     for deposit in deposits {
-        if let Err(err) = process_deposit(db, deposit).await {
+        if let Err(err) = process_deposit(db, &wallets_by_address, deposit).await {
             tracing::warn!(error = %err, "failed to process deposit");
         }
     }
     Ok(())
 }
 
-async fn process_deposit(db: &PgPool, d: crate::blockchain::stellar::DetectedDeposit) -> Result<(), String> {
-    let Some(wallet) = wallets::wallet_by_address(db, &d.destination).await.map_err(|e| e.to_string())?
-    else {
+async fn process_deposit(
+    db: &PgPool,
+    wallets_by_address: &HashMap<String, Wallet>,
+    d: crate::blockchain::stellar::DetectedDeposit,
+) -> Result<(), String> {
+    let Some(wallet) = wallets_by_address.get(&d.destination) else {
         return Ok(());
     };
     let memo = d.memo.clone();

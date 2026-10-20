@@ -2,7 +2,7 @@ use sqlx::PgPool;
 
 use crate::models::{
     AdminMerchantRow, AdminOverview, AdminPaymentRequestRow, AdminTransactionRow, AdminUserRow,
-    AdminWalletRow, AdminWithdrawalRow, AssetTotal, StatusCount,
+    AdminWalletRow, AdminWithdrawalRow, AssetTotal, Merchant, StatusCount,
 };
 
 pub async fn overview(db: &PgPool) -> Result<AdminOverview, sqlx::Error> {
@@ -71,7 +71,7 @@ pub async fn users(db: &PgPool, limit: i64) -> Result<Vec<AdminUserRow>, sqlx::E
 pub async fn merchants(db: &PgPool, limit: i64) -> Result<Vec<AdminMerchantRow>, sqlx::Error> {
     sqlx::query_as::<_, AdminMerchantRow>(
         "SELECT m.id, m.name, m.user_id AS owner_user_id, u.email AS owner_email, m.created_at,
-                w.address AS wallet_address
+                m.kyc_status, w.address AS wallet_address
          FROM merchants m
          JOIN users u ON u.id = m.user_id
          LEFT JOIN wallets w ON w.merchant_id = m.id
@@ -81,6 +81,56 @@ pub async fn merchants(db: &PgPool, limit: i64) -> Result<Vec<AdminMerchantRow>,
     .bind(limit)
     .fetch_all(db)
     .await
+}
+
+pub async fn submit_kyc(
+    db: &PgPool,
+    merchant_id: uuid::Uuid,
+    bvn: Option<&str>,
+    cac_number: Option<&str>,
+) -> Result<Merchant, sqlx::Error> {
+    sqlx::query_as::<_, Merchant>(
+        "UPDATE merchants
+         SET bvn = COALESCE($2, bvn),
+             cac_number = COALESCE($3, cac_number),
+             kyc_status = 'pending',
+             updated_at = now()
+         WHERE id = $1
+         RETURNING *",
+    )
+    .bind(merchant_id)
+    .bind(bvn)
+    .bind(cac_number)
+    .fetch_one(db)
+    .await
+}
+
+pub async fn set_kyc_status(
+    db: &PgPool,
+    merchant_id: uuid::Uuid,
+    status: &str,
+) -> Result<Merchant, sqlx::Error> {
+    sqlx::query_as::<_, Merchant>(
+        "UPDATE merchants
+         SET kyc_status = $2,
+             updated_at = now()
+         WHERE id = $1
+         RETURNING *",
+    )
+    .bind(merchant_id)
+    .bind(status)
+    .fetch_one(db)
+    .await
+}
+
+pub async fn merchant_kyc_status(
+    db: &PgPool,
+    merchant_id: uuid::Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT kyc_status FROM merchants WHERE id = $1")
+        .bind(merchant_id)
+        .fetch_optional(db)
+        .await
 }
 
 pub async fn wallets(db: &PgPool, limit: i64) -> Result<Vec<AdminWalletRow>, sqlx::Error> {

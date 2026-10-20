@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
@@ -8,6 +8,9 @@ pub struct Merchant {
     pub id: Uuid,
     pub user_id: Uuid,
     pub name: String,
+    pub kyc_status: String,
+    pub bvn: Option<String>,
+    pub cac_number: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -15,4 +18,15 @@ pub struct Merchant {
 pub struct NewMerchant {
     pub user_id: Uuid,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KycSubmission {
+    pub bvn: Option<String>,
+    pub cac_number: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminKycUpdate {
+    pub status: String,
 }

@@ -501,10 +501,42 @@ async fn me_returns_profile_for_a_valid_token() {
     assert_eq!(me["user_id"], verified["user_id"]);
     assert_eq!(me["merchant_id"], verified["merchant_id"]);
     assert_eq!(me["merchant_name"], "Test User");
-    assert!(
-        me.get("password_hash").is_none(),
-        "the password hash must never be serialized to a client"
-    );
+    common::assert_no_secret_leak(&me, "GET /me");
+}
+
+/// Every authenticated endpoint a signed-in user can reach must be free of
+/// credential material. `User` carries `password_hash` (skipped at
+/// serialization time), so any handler that accidentally serializes the whole
+/// row — or a future field derived from it — would leak here.
+#[tokio::test]
+async fn password_hash_never_serialized() {
+    let Some(app) = app().await else {
+        return;
+    };
+    let (_, _, verified) = signup_and_verify(&app, "nohash").await;
+    let token = verified["token"].as_str().unwrap();
+
+    // The signup/verify responses themselves must be clean too.
+    common::assert_no_secret_leak(&verified, "POST /verify-otp");
+
+    let endpoints: &[(&str, &str)] = &[
+        ("GET", "/me"),
+        ("GET", "/withdrawals"),
+        ("GET", "/payments"),
+        ("GET", "/balances"),
+        ("GET", "/wallets"),
+        ("GET", "/payment-requests"),
+        ("GET", "/merchants/kyc"),
+    ];
+
+    for (method, path) in endpoints {
+        let (status, body) = send(app.clone(), method, path, Some(token), None).await;
+        assert!(
+            status.is_success(),
+            "{method} {path} failed with {status}: {body}"
+        );
+        common::assert_no_secret_leak(&body, &format!("{method} {path}"));
+    }
 }
 
 #[tokio::test]

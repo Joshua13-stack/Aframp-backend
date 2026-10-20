@@ -3,7 +3,9 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::auth::extractor::AuthUser;
-use crate::error::{bad_gateway, bad_request, bad_request_field, internal, ApiResult, ErrorCode};
+use crate::error::{
+    bad_gateway, bad_request, bad_request_field, forbidden, internal, ApiResult, ErrorCode,
+};
 use crate::models::{CreateWithdrawalRequest, NewWithdrawal, Withdrawal};
 use crate::pagination::{Cursor, Page};
 use crate::services::withdrawals::{self, WithdrawalError};
@@ -37,6 +39,16 @@ pub async fn create(
         return Err(bad_request_field(
             "account_number",
             "must be a 10-digit NUBAN account number",
+        ));
+    }
+    let kyc_status = withdrawals::merchant_kyc_status(&state.db, merchant_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "no merchant associated with this account"))?;
+    if kyc_status != "verified" {
+        return Err(forbidden(
+            ErrorCode::KycRequired,
+            "merchant KYC verification required before withdrawals",
         ));
     }
     let withdrawal = withdrawals::create_withdrawal(

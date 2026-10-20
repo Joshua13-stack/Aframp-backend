@@ -21,6 +21,7 @@ pub struct MeView {
     pub created_at: DateTime<Utc>,
     pub merchant_id: Option<Uuid>,
     pub merchant_name: Option<String>,
+    pub kyc_status: Option<String>,
 }
 
 pub async fn get(State(state): State<AppState>, auth: AuthUser) -> ApiResult<Json<MeView>> {
@@ -40,6 +41,7 @@ pub async fn get(State(state): State<AppState>, auth: AuthUser) -> ApiResult<Jso
         is_admin: user.is_admin,
         created_at: user.created_at,
         merchant_id: merchant.as_ref().map(|m| m.id),
-        merchant_name: merchant.map(|m| m.name),
+        merchant_name: merchant.as_ref().map(|m| m.name.clone()),
+        kyc_status: merchant.map(|m| m.kyc_status),
     }))
 }

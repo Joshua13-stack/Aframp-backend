@@ -10,6 +10,16 @@ use serde_json::json;
 
 use common::{ensure_merchant, send, state};
 
+/// Marks a merchant as KYC-verified directly in the DB so withdrawal tests
+/// exercise the payout path rather than the KYC gate.
+async fn verify_merchant(state: &aframp::AppState, merchant_id: &str) {
+    sqlx::query("UPDATE merchants SET kyc_status = 'verified' WHERE id = $1::uuid")
+        .bind(merchant_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+}
+
 struct FailingProvider;
 
 #[async_trait]
@@ -58,7 +68,8 @@ async fn withdrawal_insufficient_balance_rejected() {
         return;
     };
     let app = aframp::router(state.clone());
-    let (token, _) = ensure_merchant(&app, "insufficient").await;
+    let (token, merchant_id) = ensure_merchant(&app, "insufficient").await;
+    verify_merchant(&state, &merchant_id).await;
 
     let (status, json) = send(
         app.clone(),
@@ -83,7 +94,8 @@ async fn withdrawal_validates_bank_details() {
         return;
     };
     let app = aframp::router(state.clone());
-    let (token, _) = ensure_merchant(&app, "validation").await;
+    let (token, merchant_id) = ensure_merchant(&app, "validation").await;
+    verify_merchant(&state, &merchant_id).await;
 
     let (status, _) = send(
         app.clone(),
@@ -107,6 +119,7 @@ async fn withdrawal_success_decrements_balance() {
     };
     let app = aframp::router(state.clone());
     let (token, merchant_id) = ensure_merchant(&app, "withdraw_ok").await;
+    verify_merchant(&state, &merchant_id).await;
 
     sqlx::query(
         "INSERT INTO balances (merchant_id, asset, available, pending)
@@ -156,6 +169,7 @@ async fn withdrawal_full_balance_then_insufficient() {
     };
     let app = aframp::router(state.clone());
     let (token, merchant_id) = ensure_merchant(&app, "drain").await;
+    verify_merchant(&state, &merchant_id).await;
 
     sqlx::query(
         "INSERT INTO balances (merchant_id, asset, available, pending)
@@ -202,6 +216,7 @@ async fn withdrawal_unsupported_asset_rejected() {
     };
     let app = aframp::router(state.clone());
     let (token, merchant_id) = ensure_merchant(&app, "unsupported_asset").await;
+    verify_merchant(&state, &merchant_id).await;
 
     sqlx::query(
         "INSERT INTO balances (merchant_id, asset, available, pending)
@@ -236,6 +251,7 @@ async fn withdrawal_rejects_sub_kobo_precision() {
     };
     let app = aframp::router(state.clone());
     let (token, merchant_id) = ensure_merchant(&app, "precision").await;
+    verify_merchant(&state, &merchant_id).await;
 
     // Balance is large enough that insufficient-balance can't be the reason
     // this is rejected — isolates the precision check specifically.
@@ -275,6 +291,7 @@ async fn withdrawal_payout_failure_refunds_balance_and_records_reason() {
     state.payment_provider = Arc::new(FailingProvider);
     let app = aframp::router(state.clone());
     let (token, merchant_id) = ensure_merchant(&app, "payout_fail").await;
+    verify_merchant(&state, &merchant_id).await;
 
     sqlx::query(
         "INSERT INTO balances (merchant_id, asset, available, pending)
@@ -329,7 +346,8 @@ async fn withdrawal_insufficient_balance_never_calls_provider() {
     // happening before the provider is ever invoked.
     state.payment_provider = Arc::new(MockProvider);
     let app = aframp::router(state.clone());
-    let (token, _) = ensure_merchant(&app, "insufficient_mock").await;
+    let (token, merchant_id) = ensure_merchant(&app, "insufficient_mock").await;
+    verify_merchant(&state, &merchant_id).await;
 
     let (status, json) = send(
         app.clone(),
@@ -356,6 +374,7 @@ async fn withdrawal_invalid_bank_code_refunds_balance_and_records_reason() {
     state.payment_provider = Arc::new(InvalidBankCodeProvider);
     let app = aframp::router(state.clone());
     let (token, merchant_id) = ensure_merchant(&app, "invalid_bank_code").await;
+    verify_merchant(&state, &merchant_id).await;
 
     sqlx::query(
         "INSERT INTO balances (merchant_id, asset, available, pending)
@@ -406,6 +425,7 @@ async fn withdrawal_invalid_account_number_refunds_balance_and_records_reason() 
     state.payment_provider = Arc::new(InvalidAccountNumberProvider);
     let app = aframp::router(state.clone());
     let (token, merchant_id) = ensure_merchant(&app, "invalid_account_number").await;
+    verify_merchant(&state, &merchant_id).await;
 
     sqlx::query(
         "INSERT INTO balances (merchant_id, asset, available, pending)
@@ -456,6 +476,7 @@ async fn withdrawal_paystack_timeout_refunds_balance_and_records_reason() {
     state.payment_provider = Arc::new(TimeoutProvider);
     let app = aframp::router(state.clone());
     let (token, merchant_id) = ensure_merchant(&app, "paystack_timeout").await;
+    verify_merchant(&state, &merchant_id).await;
 
     sqlx::query(
         "INSERT INTO balances (merchant_id, asset, available, pending)
@@ -496,4 +517,233 @@ async fn withdrawal_paystack_timeout_refunds_balance_and_records_reason() {
     let withdrawals = json.as_array().unwrap();
     assert_eq!(withdrawals[0]["status"], "failed");
     assert_eq!(withdrawals[0]["failure_reason"], "request to Paystack timed out");
+}
+
+#[tokio::test]
+async fn withdrawal_blocked_for_unverified_merchant() {
+    let Some(state) = state().await else {
+        return;
+    };
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "kyc_unverified").await;
+
+    sqlx::query(
+        "INSERT INTO balances (merchant_id, asset, available, pending)
+         VALUES ($1::uuid, 'cNGN', 5_000_000, 0)",
+    )
+    .bind(&merchant_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (status, json) = send(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(json!({
+            "amount_stroops": 2_000_000,
+            "asset": "cNGN",
+            "bank_code": "058",
+            "account_number": "0123456789"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "expected KYC gate: {json}");
+    assert_eq!(json["error"], "merchant KYC verification required before withdrawals");
+
+    // The balance must be untouched since the gate fires before any debit.
+    let balance = sqlx::query_scalar::<_, i64>(
+        "SELECT available FROM balances WHERE merchant_id = $1::uuid AND asset = 'cNGN'",
+    )
+    .bind(&merchant_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(balance, 5_000_000, "balance should not be debited when KYC gate blocks");
+}
+
+#[tokio::test]
+async fn kyc_submission_sets_status_pending() {
+    let Some(state) = state().await else {
+        return;
+    };
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "kyc_submit").await;
+
+    let (status, json) = send(
+        app.clone(),
+        "PUT",
+        "/merchants/kyc",
+        Some(&token),
+        Some(json!({
+            "bvn": "12345678901",
+            "cac_number": "RC1234567"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "kyc submission failed: {json}");
+    assert_eq!(json["kyc_status"], "pending");
+
+    let kyc_status = sqlx::query_scalar::<_, String>(
+        "SELECT kyc_status FROM merchants WHERE id = $1::uuid",
+    )
+    .bind(&merchant_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap();
+    assert_eq!(kyc_status, "pending");
+
+    // Still gated while pending.
+    let (status, json) = send(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(json!({
+            "amount_stroops": 1_000_000,
+            "asset": "cNGN",
+            "bank_code": "058",
+            "account_number": "0123456789"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "pending KYC should still block: {json}");
+}
+
+#[tokio::test]
+async fn admin_kyc_approval_allows_withdrawal() {
+    let Some(state) = state().await else {
+        return;
+    };
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "kyc_approve").await;
+
+    sqlx::query(
+        "INSERT INTO balances (merchant_id, asset, available, pending)
+         VALUES ($1::uuid, 'cNGN', 5_000_000, 0)",
+    )
+    .bind(&merchant_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    // Submit KYC first so the merchant is in the pending state.
+    let (status, _) = send(
+        app.clone(),
+        "PUT",
+        "/merchants/kyc",
+        Some(&token),
+        Some(json!({
+            "bvn": "12345678901",
+            "cac_number": "RC1234567"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Admin approves.
+    let (status, json) = send(
+        app.clone(),
+        "PATCH",
+        &format!("/admin/merchants/{merchant_id}/kyc"),
+        None,
+        Some(json!({ "kyc_status": "verified" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin approval failed: {json}");
+    assert_eq!(json["kyc_status"], "verified");
+
+    // Withdrawal now succeeds.
+    let (status, json) = send(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(json!({
+            "amount_stroops": 2_000_000,
+            "asset": "cNGN",
+            "bank_code": "058",
+            "account_number": "0123456789"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "withdraw failed after approval: {json}");
+    assert_eq!(json["status"], "pending");
+}
+
+#[tokio::test]
+async fn admin_kyc_rejection_blocks_withdrawal() {
+    let Some(state) = state().await else {
+        return;
+    };
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "kyc_reject").await;
+
+    sqlx::query(
+        "INSERT INTO balances (merchant_id, asset, available, pending)
+         VALUES ($1::uuid, 'cNGN', 5_000_000, 0)",
+    )
+    .bind(&merchant_id)
+    .execute(&state.db)
+    .await
+    .unwrap();
+
+    let (status, _) = send(
+        app.clone(),
+        "PUT",
+        "/merchants/kyc",
+        Some(&token),
+        Some(json!({
+            "bvn": "12345678901",
+            "cac_number": "RC1234567"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, json) = send(
+        app.clone(),
+        "PATCH",
+        &format!("/admin/merchants/{merchant_id}/kyc"),
+        None,
+        Some(json!({ "kyc_status": "rejected" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin rejection failed: {json}");
+    assert_eq!(json["kyc_status"], "rejected");
+
+    let (status, json) = send(
+        app.clone(),
+        "POST",
+        "/withdraw",
+        Some(&token),
+        Some(json!({
+            "amount_stroops": 2_000_000,
+            "asset": "cNGN",
+            "bank_code": "058",
+            "account_number": "0123456789"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "rejected KYC should block: {json}");
+}
+
+#[tokio::test]
+async fn me_surfaces_kyc_status() {
+    let Some(state) = state().await else {
+        return;
+    };
+    let app = aframp::router(state.clone());
+    let (token, merchant_id) = ensure_merchant(&app, "kyc_me").await;
+
+    let (status, json) = send(app.clone(), "GET", "/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["kyc_status"], "unverified");
+
+    verify_merchant(&state, &merchant_id).await;
+
+    let (status, json) = send(app.clone(), "GET", "/me", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["kyc_status"], "verified");
 }

@@ -8,6 +8,11 @@ use crate::payments::{PaymentProvider, PayoutRequest};
 /// cNGN is pegged 1:1 to NGN, so 1 kobo = 100,000 stroops.
 const STROOPS_PER_KOBO: i64 = 100_000;
 
+/// Full column list for a `withdrawals` row, in the order expected by
+/// [`Withdrawal`]'s `FromRow` implementation. Keep this in sync with the model.
+const WITHDRAWAL_COLUMNS: &str = "id, merchant_id, amount_stroops, asset, status, provider, \
+     provider_reference, bank_code, account_number, failure_reason, created_at, updated_at";
+
 #[derive(Debug, thiserror::Error)]
 pub enum WithdrawalError {
     #[error("insufficient available balance")]
@@ -54,15 +59,13 @@ pub async fn create_withdrawal(
         return Err(WithdrawalError::InsufficientBalance);
     }
 
-    let w = sqlx::query_as::<_, Withdrawal>(
+    let w = sqlx::query_as::<_, Withdrawal>(&format!(
         "INSERT INTO withdrawals (
              merchant_id, amount_stroops, asset, status, bank_code, account_number
          )
          VALUES ($1, $2, $3, 'pending', $4, $5)
-         RETURNING id, merchant_id, amount_stroops, asset, status, provider,
-                   provider_reference, bank_code, account_number, failure_reason,
-                   created_at, updated_at",
-    )
+         RETURNING {WITHDRAWAL_COLUMNS}"
+    ))
     .bind(withdrawal.merchant_id)
     .bind(withdrawal.amount_stroops)
     .bind(&withdrawal.asset)
@@ -92,14 +95,12 @@ pub async fn create_withdrawal(
             // info — recoverable later, and safe: it under-states what happened
             // (a real transfer may have gone out) rather than erasing the record
             // that a withdrawal was attempted at all.
-            sqlx::query_as::<_, Withdrawal>(
+            sqlx::query_as::<_, Withdrawal>(&format!(
                 "UPDATE withdrawals
                     SET provider = $2, provider_reference = $3, status = $4, updated_at = now()
                   WHERE id = $1
-                  RETURNING id, merchant_id, amount_stroops, asset, status, provider,
-                            provider_reference, bank_code, account_number, failure_reason,
-                            created_at, updated_at",
-            )
+                  RETURNING {WITHDRAWAL_COLUMNS}"
+            ))
             .bind(w.id)
             .bind(&result.provider)
             .bind(&result.provider_reference)
@@ -146,15 +147,13 @@ pub async fn withdrawals_by_merchant(
     merchant_id: Uuid,
     limit: i64,
 ) -> Result<Vec<Withdrawal>, sqlx::Error> {
-    sqlx::query_as::<_, Withdrawal>(
-        "SELECT id, merchant_id, amount_stroops, asset, status, provider,
-                provider_reference, bank_code, account_number, failure_reason,
-                created_at, updated_at
+    sqlx::query_as::<_, Withdrawal>(&format!(
+        "SELECT {WITHDRAWAL_COLUMNS}
            FROM withdrawals
           WHERE merchant_id = $1
           ORDER BY created_at DESC
-          LIMIT $2",
-    )
+          LIMIT $2"
+    ))
     .bind(merchant_id)
     .bind(limit)
     .fetch_all(db)
@@ -172,16 +171,14 @@ pub async fn withdrawals_by_merchant_cursor(
 ) -> Result<Vec<Withdrawal>, sqlx::Error> {
     match cursor {
         Some(c) => {
-            sqlx::query_as::<_, Withdrawal>(
-                "SELECT id, merchant_id, amount_stroops, asset, status, provider,
-                        provider_reference, bank_code, account_number, failure_reason,
-                        created_at, updated_at
+            sqlx::query_as::<_, Withdrawal>(&format!(
+                "SELECT {WITHDRAWAL_COLUMNS}
                    FROM withdrawals
                   WHERE merchant_id = $1
                     AND (created_at, id) < ($2, $3)
                   ORDER BY created_at DESC, id DESC
-                  LIMIT $4",
-            )
+                  LIMIT $4"
+            ))
             .bind(merchant_id)
             .bind(c.created_at)
             .bind(c.id)
@@ -190,15 +187,13 @@ pub async fn withdrawals_by_merchant_cursor(
             .await
         }
         None => {
-            sqlx::query_as::<_, Withdrawal>(
-                "SELECT id, merchant_id, amount_stroops, asset, status, provider,
-                        provider_reference, bank_code, account_number, failure_reason,
-                        created_at, updated_at
+            sqlx::query_as::<_, Withdrawal>(&format!(
+                "SELECT {WITHDRAWAL_COLUMNS}
                    FROM withdrawals
                   WHERE merchant_id = $1
                   ORDER BY created_at DESC, id DESC
-                  LIMIT $2",
-            )
+                  LIMIT $2"
+            ))
             .bind(merchant_id)
             .bind(limit + 1)
             .fetch_all(db)
