@@ -25,6 +25,7 @@ pub enum ErrorCode {
     OtpChallengeNotFound,
     OtpLocked,
     TooManyRequests,
+    KycRequired,
     PayloadTooLarge,
     InternalError,
 }
@@ -56,6 +57,7 @@ impl ErrorCode {
             ErrorCode::OtpChallengeNotFound => "OTP_CHALLENGE_NOT_FOUND",
             ErrorCode::OtpLocked => "OTP_LOCKED",
             ErrorCode::TooManyRequests => "TOO_MANY_REQUESTS",
+            ErrorCode::KycRequired => "KYC_REQUIRED",
             ErrorCode::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
             ErrorCode::InternalError => "INTERNAL_ERROR",
         }
@@ -71,6 +73,10 @@ pub struct ApiError {
 }
 
 pub type ApiResult<T> = Result<T, (StatusCode, Json<ApiError>)>;
+
+/// Message returned when a merchant attempts a payout without being KYC-verified.
+pub const KYC_REQUIRED_MESSAGE: &str =
+    "merchant KYC verification is required before requesting withdrawals";
 
 pub fn bad_request(code: ErrorCode, message: &str) -> (StatusCode, Json<ApiError>) {
     error(StatusCode::BAD_REQUEST, code, message)

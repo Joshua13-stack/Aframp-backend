@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::models::{KycStatus, Merchant, NewWithdrawal, Withdrawal};
+use crate::payments::{PaymentProvider, PayoutRequest};
 use crate::models::status::WithdrawalStatus;
 use crate::models::{NewWithdrawal, Withdrawal};
 use crate::payments::{PaymentProvider, PayoutRequest, PayoutResult};
@@ -56,10 +58,49 @@ pub enum WithdrawalError {
     AccountVerificationFailed(String),
     #[error("payout provider failed: {0}")]
     PayoutFailed(String),
+    #[error("merchant KYC verification is required before withdrawing")]
+    KycRequired,
+    #[error("at least one KYC identifier (BVN or CAC number) is required")]
+    KycIdentifierRequired,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
 
+/// Submit basic KYC information for a merchant. At least one identifier must be
+/// provided. On success the merchant's `kyc_status` moves to `pending` and the
+/// submitted values are recorded for admin review.
+pub async fn submit_kyc(
+    db: &PgPool,
+    merchant_id: Uuid,
+    bvn: Option<String>,
+    cac_number: Option<String>,
+) -> Result<Merchant, WithdrawalError> {
+    let bvn = bvn.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let cac_number = cac_number
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    if bvn.is_none() && cac_number.is_none() {
+        return Err(WithdrawalError::KycIdentifierRequired);
+    }
+
+    let merchant = sqlx::query_as::<_, Merchant>(
+        "UPDATE merchants
+            SET kyc_status = 'pending',
+                kyc_bvn = $2,
+                kyc_cac_number = $3,
+                kyc_submitted_at = now(),
+                updated_at = now()
+          WHERE id = $1
+          RETURNING *",
+    )
+    .bind(merchant_id)
+    .bind(&bvn)
+    .bind(&cac_number)
+    .fetch_one(db)
+    .await?;
+
+    Ok(merchant)
 /// Look up a withdrawal by its idempotency key for a given merchant.
 pub async fn withdrawal_by_idempotency_key(
     db: &PgPool,
@@ -187,6 +228,15 @@ pub async fn create_withdrawal_idempotent(
     }
     let amount_kobo = withdrawal.amount_stroops / STROOPS_PER_KOBO;
 
+    // Gate payouts on KYC verification before touching the balance so an
+    // unverified merchant can never even attempt a withdrawal.
+    let kyc_status: KycStatus = sqlx::query_scalar("SELECT kyc_status FROM merchants WHERE id = $1")
+        .bind(withdrawal.merchant_id)
+        .fetch_one(db)
+        .await?;
+    if kyc_status != KycStatus::Verified {
+        return Err(WithdrawalError::KycRequired);
+    }
     // Idempotency fast path: if the caller supplied a key and we've already
     // processed it, return the original row untouched — no second debit, no
     // second Paystack transfer.

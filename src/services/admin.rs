@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::models::{
     AdminMerchantRow, AdminOverview, AdminPaymentRequestRow, AdminTransactionRow, AdminUserRow,
+    AdminWalletRow, AdminWithdrawalRow, AssetTotal, KycStatus, StatusCount,
     AdminWalletRow, AdminWithdrawalRow, AssetTotal, Merchant, StatusCount,
 };
 
@@ -140,6 +141,8 @@ pub async fn users(db: &PgPool, limit: i64) -> Result<Vec<AdminUserRow>, sqlx::E
 pub async fn merchants(db: &PgPool, limit: i64) -> Result<Vec<AdminMerchantRow>, sqlx::Error> {
     sqlx::query_as::<_, AdminMerchantRow>(
         "SELECT m.id, m.name, m.user_id AS owner_user_id, u.email AS owner_email, m.created_at,
+                m.kyc_status, m.kyc_submitted_at,
+                w.address AS wallet_address
                 (SELECT w.address FROM wallets w
                  WHERE w.merchant_id = m.id
                  ORDER BY w.created_at DESC
@@ -151,6 +154,35 @@ pub async fn merchants(db: &PgPool, limit: i64) -> Result<Vec<AdminMerchantRow>,
     )
     .bind(limit)
     .fetch_all(db)
+    .await
+}
+
+pub async fn set_merchant_kyc(
+    db: &PgPool,
+    merchant_id: Uuid,
+    status: KycStatus,
+    rejection_reason: Option<&str>,
+) -> Result<Option<AdminMerchantRow>, sqlx::Error> {
+    sqlx::query_as::<_, AdminMerchantRow>(
+        "WITH updated AS (
+             UPDATE merchants
+             SET kyc_status = $2,
+                 kyc_reviewed_at = now(),
+                 kyc_rejection_reason = $3
+             WHERE id = $1
+             RETURNING id, name, user_id, created_at, kyc_status, kyc_submitted_at
+         )
+         SELECT m.id, m.name, m.user_id AS owner_user_id, u.email AS owner_email, m.created_at,
+                m.kyc_status, m.kyc_submitted_at,
+                w.address AS wallet_address
+         FROM updated m
+         JOIN users u ON u.id = m.user_id
+         LEFT JOIN wallets w ON w.merchant_id = m.id",
+    )
+    .bind(merchant_id)
+    .bind(status)
+    .bind(rejection_reason)
+    .fetch_optional(db)
     .await
 }
 

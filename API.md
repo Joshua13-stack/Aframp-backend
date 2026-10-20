@@ -166,6 +166,9 @@ Field-level validation errors also include the offending `field`; all other erro
 | `401` | Missing, malformed, or expired token | Redirect to login |
 | `404` | Resource not found | — |
 | `409` | Email or phone already registered | Show on the signup form |
+| `403` | Authenticated, but not an admin (`/admin/*` only), or merchant KYC not verified (withdrawals) | Show the `error`; for `KYC_REQUIRED`, route to KYC submission |
+| `429` | OTP resent too soon, or too many times this hour | Show the wait; don't auto-retry |
+| `502` | Upstream payment provider failed | Transient — the `error` carries the provider's own message |
 | `403` | Authenticated but not an admin, or the merchant account is suspended | Show an authorization error; contact support if the account is suspended |
 | `429` | OTP resend cooldown/hourly cap, or login attempt limit | Wait for the cooldown; don't auto-retry |
 | `403` | Authenticated, but not an admin (`/admin/*` only) | Not applicable to merchant-facing routes |
@@ -175,6 +178,28 @@ Field-level validation errors also include the offending `field`; all other erro
 
 ### Error code catalog
 
+| Code | Status | When it's returned |
+|---|---|---|
+| `INVALID_PARAMETERS` | `400` | A required field is missing/malformed (e.g. short password, bad account_number/bank_code) |
+| `INVALID_AMOUNT` | `400` | Amount is not positive, or not a whole number of kobo |
+| `INSUFFICIENT_BALANCE` | `400` | Withdrawal exceeds the available balance |
+| `UNSUPPORTED_ASSET` | `400` | Withdrawal asset isn't cNGN |
+| `EMAIL_TAKEN` | `409` | Signup email already registered (to a verified account) |
+| `PHONE_TAKEN` | `409` | Signup phone already registered (to a verified account) |
+| `INVALID_CREDENTIALS` | `401` | Wrong password or unknown email on login |
+| `USER_NOT_FOUND` | `404` | Authenticated user no longer exists |
+| `MERCHANT_NOT_FOUND` | `400` | Account has no merchant (visit onboarding) |
+| `WALLET_NOT_FOUND` | `400` | No wallet yet, or none created before a payment-request call |
+| `PAYMENT_REQUEST_NOT_FOUND` | `404` | Payment request id doesn't exist |
+| `PAYOUT_FAILED` | `502` | Upstream payment provider rejected the payout |
+| `FORBIDDEN` | `403` | Authenticated but not an admin, on an `/admin/*` route |
+| `KYC_REQUIRED` | `403` | Withdrawal attempted while `kyc_status` is not `verified` |
+| `OTP_INVALID` | `400` | Wrong code submitted to `/verify-otp` |
+| `OTP_EXPIRED` | `400` | Code submitted after its 10-minute window |
+| `OTP_LOCKED` | `400` | 5 wrong attempts on this challenge — request a new one |
+| `OTP_CHALLENGE_NOT_FOUND` | `404` | Unknown or already-consumed `challenge_id` |
+| `TOO_MANY_REQUESTS` | `429` | OTP resent inside the 60s cooldown, or 5th+ send this hour |
+| `INTERNAL_ERROR` | `500` | Unexpected server error; generic message only |
 Every `ErrorCode` variant defined in `src/error.rs` is listed below, with the HTTP status it travels with and the endpoints that can emit it. Match on `code`; the `error` string is for humans and may change.
 
 | Code | HTTP Status | Description | Endpoints that can return it |
@@ -448,7 +473,8 @@ Auth required. The signed-in user's profile. The JWT carries only ids, so call t
   "phone_verified": true,
   "created_at": "2026-08-13T14:15:34.232320Z",
   "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
-  "merchant_name": "Shop Name"
+  "merchant_name": "Shop Name",
+  "kyc_status": "unverified"
 }
 ```
 
@@ -475,6 +501,68 @@ Auth required. The signed-in user's merchant profile on its own, separate from `
 }
 ```
 `404` with `MERCHANT_NOT_FOUND` when the account has no merchant profile. `email`, `unsubscribe_token` and `suspended_at` are `null` when unset.
+
+`kyc_status` is the merchant's current verification state — one of `unverified`, `pending`, `verified`, or `rejected` (see [Merchant KYC](#merchant-kyc)). It is `null` when the account has no merchant. Use it to decide whether to prompt for KYC or enable withdrawals in the UI.
+
+---
+
+### Merchant KYC
+
+Merchants must be KYC-verified before they can withdraw. The `merchants` table carries a `kyc_status` column with four states:
+
+| `kyc_status` | Meaning |
+|---|---|
+| `unverified` | Default for a new merchant. No KYC submitted yet. |
+| `pending` | Merchant submitted KYC info; awaiting admin review. |
+| `verified` | Admin approved. Withdrawals are allowed. |
+| `rejected` | Admin rejected the submission. Merchant may resubmit. |
+
+**Withdrawals require `kyc_status == "verified"`.** Any other state gets `403 KYC_REQUIRED` from `POST /withdraw`.
+
+### `PUT /merchants/kyc`
+Auth required. The merchant submits basic identity/business info for verification. On success the merchant's `kyc_status` moves to `pending` (from `unverified` or `rejected`). Submitting while already `pending` or `verified` is a no-op that returns the current state.
+
+```json
+{ "bvn": "12345678901", "cac_number": "RC1234567" }
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `bvn` | yes | 11-digit Bank Verification Number |
+| `cac_number` | no | CAC registration number for the business |
+
+`200` →
+```json
+{
+  "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
+  "kyc_status": "pending"
+}
+```
+
+Errors: `400` (`INVALID_PARAMETERS`) if `bvn` is missing or not 11 digits. `400` (`MERCHANT_NOT_FOUND`) if the account has no merchant.
+
+> Submitted KYC details are stored server-side and are **never** echoed back in any response. Only the resulting `kyc_status` is exposed.
+
+### `PATCH /admin/merchants/{id}/kyc`
+Admin only. Approves or rejects a merchant's KYC submission. Requires an admin JWT; a non-admin gets `403 FORBIDDEN`.
+
+```json
+{ "kyc_status": "verified" }
+```
+
+`kyc_status` must be `verified` or `rejected` — `unverified` and `pending` are not settable by an admin.
+
+`200` →
+```json
+{
+  "merchant_id": "6a91d75c-8c41-4fa5-b10b-6eb8cda8ac0a",
+  "kyc_status": "verified"
+}
+```
+
+Errors: `403` (`FORBIDDEN`) if the caller isn't an admin. `400` (`INVALID_PARAMETERS`) if `kyc_status` isn't `verified` or `rejected`. `404` (`MERCHANT_NOT_FOUND`) if the merchant id doesn't exist.
+
+Admin merchant views (e.g. `GET /admin/merchants`, `GET /admin/merchants/{id}`) include `kyc_status` on every merchant row so reviewers can filter the queue.
 
 ---
 
@@ -810,6 +898,8 @@ Auth required. Detected incoming payments, newest first. Query: `?limit=` (defau
 #### Request and Success
 Auth required. Debits the merchant's balance and initiates a Nigerian bank payout via Paystack.
 
+**Requires `kyc_status == "verified"`.** Any other state (`unverified`, `pending`, `rejected`) returns `403` with `code: "KYC_REQUIRED"` and a message pointing at `PUT /merchants/kyc`. Check `kyc_status` from `GET /me` before showing the withdraw form.
+
 ```json
 { "amount_stroops": 500000000, "asset": "cNGN", "bank_code": "058", "account_number": "0123456789" }
 ```
@@ -837,6 +927,12 @@ Generate a fresh key per logical withdrawal (not per HTTP attempt) and reuse it 
 
 Validation errors (`400`): `"insufficient available balance"`, `"withdrawals are only supported for the cNGN asset"`, `"amount_stroops must be a whole number of kobo"`, `"positive amount_stroops, bank_code, and a 10-digit account_number are required"`.
 
+KYC error (`403`):
+```json
+{ "error": "merchant KYC must be verified before withdrawing", "code": "KYC_REQUIRED" }
+```
+
+> **Payouts do not currently complete.** The Paystack integration is real and correct, but Aframp's Paystack balance is unfunded, so live calls return `502` with *"Your balance is not enough to fulfil this request."* On failure the balance is **automatically refunded** and the withdrawal is recorded with `status: "failed"` and a `failure_reason` — no money or ledger record is lost. Treat `502` as "try later," not as data loss. Paystack's own minimum transfer is ₦50 = `500000000` stroops.
 #### `502 Bad Gateway` — Paystack / payout provider failure
 
 When the upstream payout provider (Paystack) rejects or fails the transfer, the API returns:
@@ -923,6 +1019,12 @@ async function waitForPayment(id, { signal } = {}) {
 
 Note step 3 needs no auth token, so a customer-facing payment page can use it directly.
 
+### Onboarding a merchant for withdrawals
+
+1. `GET /me` → read `kyc_status`
+2. If not `verified`, collect BVN (and CAC number) and `PUT /merchants/kyc` → status becomes `pending`
+3. Poll `GET /me` (or refresh on next load) until an admin sets `verified` or `rejected`
+4. Only when `kyc_status === "verified"` show the withdraw form; otherwise `POST /withdraw` returns `403 KYC_REQUIRED`
 **Prefer the status endpoint for polling.** `GET /payment-requests/{id}/status` returns only `{ id, status, paid_at }` — the same status and the same read-time expiry logic as the full object, without the `amount_stroops`/`address`/`sep7_uri` payload. Fetch the full `GET /payment-requests/{id}` once, up front, to render the QR and amount; poll the status endpoint after that.
 
 ---
@@ -1028,7 +1130,9 @@ Worth knowing before you design around them:
 - **No cursor pagination.** `limit` only, capped at 200.
 - **No rate limiting on the password check itself.** OTP sends are throttled (60s cooldown, 5/hour per phone), but nothing yet stops repeated wrong-password guesses against `/login` before it ever gets to that step.
 - **No cancel/delete on payment requests.** They can only expire naturally.
+- **No `PATCH`/`DELETE` anywhere** — and CORS only allows `GET`/`POST`, so adding one needs a server change too. (`PATCH /admin/merchants/{id}/kyc` is the exception; it's admin-only and reached from a non-browser client.)
 - **`DELETE /payment-requests/{id}`** soft-cancels a request (sets `cancelled_at`). CORS allows `GET`/`POST`/`DELETE`.
 - **Legacy analytics endpoint** (`GET /analytics?period=7d|30d|90d`) is a proposed contract only and is not currently served. See `GET /analytics/payments` for the implemented contract.
 - **cNGN QR codes**, pending a real issuer address.
 - **Completed payouts**, pending funding (see `PRD.md` §9.1).
+- **Automated KYC verification.** Submissions are reviewed manually by an admin via `PATCH /admin/merchants/{id}/kyc`; there's no BVN/CAC lookup against an external provider yet.

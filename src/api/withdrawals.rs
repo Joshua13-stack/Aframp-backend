@@ -6,6 +6,9 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
+use crate::error::{
+    bad_gateway, bad_request, bad_request_field, forbidden, internal, ApiResult, ErrorCode,
+};
 use crate::error::{bad_gateway, bad_request, bad_request_field, internal, ApiResult, ErrorCode};
 use crate::models::{CreateWithdrawalRequest, ListParams, NewWithdrawal, Withdrawal};
 use serde::{Deserialize, Serialize};
@@ -250,6 +253,10 @@ fn map_withdrawal_error(
         WithdrawalError::InvalidAmountPrecision => bad_request(
             ErrorCode::InvalidAmount,
             "amount_stroops must be a whole number of kobo",
+        ),
+        WithdrawalError::KycRequired => forbidden(
+            ErrorCode::KycRequired,
+            "merchant KYC verification required before withdrawals",
         ),
         WithdrawalError::AccountResolutionFailed(msg) => {
             bad_request(ErrorCode::AccountResolutionFailed, &msg)

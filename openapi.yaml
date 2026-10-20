@@ -19,6 +19,7 @@ tags:
   - name: Wallet
   - name: Payment requests
   - name: Money
+  - name: Merchants
   - name: Analytics
     description: Proposed merchant reporting contract; endpoint is not implemented yet.
   - name: Webhooks
@@ -1088,6 +1089,22 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /withdraw:
+    post:
+      tags: [Money]
+      summary: Withdraw to a Nigerian bank account
+      description: >
+        Debits the balance and calls Paystack Transfers. Payouts do not currently
+        complete — Aframp's Paystack balance is unfunded, so live calls return 502.
+        On failure the balance is automatically refunded and the withdrawal is
+        recorded with status "failed" plus a failure_reason; nothing is lost.
+        Requires the merchant's kyc_status to be 'verified' — Paystack live
+        transfers reject unverified recipients.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWithdrawalRequest' }
   /admin/transactions:
     get:
       tags: [Admin]
@@ -1106,6 +1123,16 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/AdminTransactionRow' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: >
+            KYC_NOT_VERIFIED — the merchant's kyc_status is not 'verified'.
+            Submit KYC via PUT /merchants/kyc and wait for admin approval.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+        '502':
+          description: Payout provider failed; balance already refunded
         '403': { $ref: '#/components/responses/Forbidden' }
         '500': { $ref: '#/components/responses/InternalError' }
 
@@ -1150,6 +1177,63 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '500': { $ref: '#/components/responses/InternalError' }
+
+  /merchants/kyc:
+    put:
+      tags: [Merchants]
+      summary: Submit KYC information
+      description: >
+        Records the merchant's identity details and moves kyc_status from
+        'unverified' (or 'rejected') to 'pending' for admin review. Re-submitting
+        while 'pending' or 'verified' is rejected. At least one of bvn or
+        cac_number must be supplied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SubmitKycRequest' }
+      responses:
+        '200':
+          description: KYC submitted, awaiting review
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MerchantKyc' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
+
+  /admin/merchants/{id}/kyc:
+    patch:
+      tags: [Merchants]
+      summary: Approve or reject a merchant's KYC (admin only)
+      description: >
+        Admin-only. Sets kyc_status to 'verified' or 'rejected'. Requires an
+        authenticated account with admin privileges; non-admins get 403.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminKycDecisionRequest' }
+      responses:
+        '200':
+          description: KYC decision recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MerchantKyc' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: FORBIDDEN — the caller is not an admin
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '415': { $ref: '#/components/responses/UnsupportedMediaType' }
 
 components:
   securitySchemes:
@@ -1286,6 +1370,7 @@ components:
         code:
           type: string
           example: INSUFFICIENT_BALANCE
+          description: "Machine-readable error code. Full catalog: INVALID_PARAMETERS, INVALID_AMOUNT, INSUFFICIENT_BALANCE, UNSUPPORTED_ASSET, PAYOUT_FAILED, KYC_NOT_VERIFIED, KYC_ALREADY_SUBMITTED, EMAIL_TAKEN, PHONE_TAKEN, INVALID_CREDENTIALS, USER_NOT_FOUND, MERCHANT_NOT_FOUND, WALLET_NOT_FOUND, PAYMENT_REQUEST_NOT_FOUND, FORBIDDEN, OTP_INVALID, OTP_EXPIRED, OTP_LOCKED, OTP_CHALLENGE_NOT_FOUND, TOO_MANY_REQUESTS, INTERNAL_ERROR"
           description: >
             Stable machine-readable code. Match on this field, not the human
             message. See API.md for endpoint-specific codes and HTTP statuses.
@@ -1400,6 +1485,50 @@ components:
         phone_verified: { type: boolean, description: True after the phone number has been verified by OTP }
         merchant_id: { type: string, format: uuid, nullable: true }
         merchant_name: { type: string, nullable: true }
+        kyc_status:
+          $ref: '#/components/schemas/KycStatus'
+          description: Null when the account has no merchant.
+
+    KycStatus:
+      type: string
+      enum: [unverified, pending, verified, rejected]
+      description: >
+        Merchant KYC state. Only 'verified' merchants may call POST /withdraw.
+
+    SubmitKycRequest:
+      type: object
+      properties:
+        bvn:
+          type: string
+          description: 11-digit Bank Verification Number.
+          example: '12345678901'
+        cac_number:
+          type: string
+          description: CAC registration number for the business.
+          example: RC1234567
+
+    AdminKycDecisionRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [verified, rejected]
+        reason:
+          type: string
+          nullable: true
+          description: Required when rejecting; shown to the merchant.
+
+    MerchantKyc:
+      type: object
+      required: [merchant_id, kyc_status]
+      properties:
+        merchant_id: { type: string, format: uuid }
+        kyc_status: { $ref: '#/components/schemas/KycStatus' }
+        bvn: { type: string, nullable: true }
+        cac_number: { type: string, nullable: true }
+        rejection_reason: { type: string, nullable: true }
+        updated_at: { type: string, format: date-time }
 
     Merchant:
       type: object
