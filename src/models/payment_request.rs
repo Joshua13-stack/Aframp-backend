@@ -11,6 +11,7 @@ pub struct PaymentRequest {
     pub amount_stroops: i64,
     pub asset: String,
     pub memo: String,
+    pub description: Option<String>,
     pub status: String,
     pub payment_id: Option<Uuid>,
     pub expires_at: DateTime<Utc>,
@@ -23,4 +24,17 @@ pub struct CreatePaymentRequestRequest {
     pub amount_stroops: i64,
     pub asset: Option<String>,
     pub expires_in_secs: Option<i64>,
+    pub description: Option<String>,
+}
+
+impl CreatePaymentRequestRequest {
+    /// Validates the optional merchant-defined description (max 140 chars).
+    pub fn validate_description(&self) -> Result<(), String> {
+        if let Some(description) = &self.description {
+            if description.chars().count() > 140 {
+                return Err("description must be at most 140 characters".to_string());
+            }
+        }
+        Ok(())
+    }
 }

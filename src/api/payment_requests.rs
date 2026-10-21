@@ -26,6 +26,8 @@ pub struct PaymentRequestView {
     pub status: String,
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// Optional merchant-defined description (e.g. "Table 5 order").
+    pub description: Option<String>,
     /// SEP-0007 payment URI a Stellar wallet can open directly to pay this
     /// request. `None` for credit assets we don't have a real issuer address
     /// configured for yet (see PRD §9.4) — we don't guess one.
@@ -50,6 +52,24 @@ pub async fn create(
     // scannable/testable today (no cNGN issuer address configured yet).
     let asset = req.asset.unwrap_or_else(|| "XLM".into());
 
+    let description = match req.description {
+        Some(d) => {
+            let trimmed = d.trim();
+            if trimmed.chars().count() > 140 {
+                return Err(bad_request(
+                    ErrorCode::InvalidParameters,
+                    "description must be at most 140 characters",
+                ));
+            }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        None => None,
+    };
+
     let pr = payment_requests::create_payment_request(
         &state.db,
         merchant_id,
@@ -57,6 +77,7 @@ pub async fn create(
         req.amount_stroops,
         asset,
         req.expires_in_secs,
+        description,
     )
     .await
     .map_err(map_payment_request_error)?;
@@ -146,7 +167,8 @@ fn to_view(pr: &PaymentRequest, address: &str, network: &str) -> PaymentRequestV
         status: effective_status(&pr.status, pr.expires_at),
         expires_at: pr.expires_at,
         created_at: pr.created_at,
-        sep7_uri: build_sep7_uri(address, pr.amount_stroops, &pr.asset, &pr.memo),
+        description: pr.description.clone(),
+        sep7_uri: build_sep7_uri(address, pr.amount_stroops, &pr.asset, &pr.memo, pr.description.as_deref()),
     }
 }
 
@@ -162,18 +184,46 @@ fn row_to_view(row: &payment_requests::PaymentRequestWithWallet) -> PaymentReque
         status: effective_status(&row.status, row.expires_at),
         expires_at: row.expires_at,
         created_at: row.created_at,
-        sep7_uri: build_sep7_uri(&row.address, row.amount_stroops, &row.asset, &row.memo),
+        description: row.description.clone(),
+        sep7_uri: build_sep7_uri(&row.address, row.amount_stroops, &row.asset, &row.memo, row.description.as_deref()),
     }
 }
 
-fn build_sep7_uri(address: &str, amount_stroops: i64, asset: &str, memo: &str) -> Option<String> {
+fn build_sep7_uri(
+    address: &str,
+    amount_stroops: i64,
+    asset: &str,
+    memo: &str,
+    description: Option<&str>,
+) -> Option<String> {
     if asset != "XLM" && asset != "native" {
         return None;
     }
     let amount = format!("{}.{:07}", amount_stroops / 10_000_000, amount_stroops % 10_000_000);
-    Some(format!(
+    let mut uri = format!(
         "web+stellar:pay?destination={address}&amount={amount}&memo={memo}&memo_type=MEMO_TEXT"
-    ))
+    );
+    if let Some(desc) = description {
+        if !desc.is_empty() {
+            uri.push_str("&msg=");
+            uri.push_str(&percent_encode(desc));
+        }
+    }
+    Some(uri)
+}
+
+/// Minimal RFC 3986 percent-encoding for the SEP-7 `msg` query parameter.
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 fn map_payment_request_error(
