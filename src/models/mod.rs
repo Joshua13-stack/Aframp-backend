@@ -13,7 +13,9 @@ pub use admin::{
     AdminMerchantRow, AdminOverview, AdminPaymentRequestRow, AdminTransactionRow, AdminUserRow,
     AdminWalletRow, AdminWithdrawalRow, AssetTotal, StatusCount,
 };
-pub use api_key::ApiKey;
+// NOTE: `ApiKey` is intentionally not re-exported. The `api_keys` table and
+// `ApiKey` model are planned infrastructure for a future API key system and are
+// not yet wired to any endpoints. See PRD.md (planned features).
 pub use otp::{OtpChallenge, OtpChallengeResponse, VerifyOtpRequest};
 pub use balance::{Balance, UpdateBalance};
 pub use merchant::{Merchant, NewMerchant};
