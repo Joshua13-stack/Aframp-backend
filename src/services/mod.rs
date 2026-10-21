@@ -5,4 +5,5 @@ pub mod payment_requests;
 pub mod payments;
 pub mod users;
 pub mod wallets;
+pub mod webhook_subscriptions;
 pub mod withdrawals;
