@@ -1,7 +1,7 @@
 use axum::extract::State;
 use axum::Json;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::extractor::AuthUser;
@@ -23,6 +23,12 @@ pub struct MeView {
     pub merchant_name: Option<String>,
 }
 
+/// Body for `PATCH /users/me`. Only the display name is mutable here.
+#[derive(Deserialize)]
+pub struct UpdateMeRequest {
+    pub name: String,
+}
+
 pub async fn get(State(state): State<AppState>, auth: AuthUser) -> ApiResult<Json<MeView>> {
     let user = users::user_by_id(&state.db, auth.user_id)
         .await
@@ -42,4 +48,28 @@ pub async fn get(State(state): State<AppState>, auth: AuthUser) -> ApiResult<Jso
         merchant_id: merchant.as_ref().map(|m| m.id),
         merchant_name: merchant.map(|m| m.name),
     }))
+}
+
+/// Update the authenticated user's profile name. The merchant row's name
+/// mirrors `users.name` (see `users::create_verified`), so both are updated
+/// in a single transaction to keep the admin view and merchant profile in
+/// sync.
+pub async fn update(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<UpdateMeRequest>,
+) -> ApiResult<Json<MeView>> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(crate::error::bad_request(
+            ErrorCode::ValidationError,
+            "name must not be empty",
+        ));
+    }
+
+    users::update_name(&state.db, auth.user_id, name)
+        .await
+        .map_err(internal)?;
+
+    get(State(state), auth).await
 }
