@@ -83,6 +83,9 @@ struct Transfer {
 #[async_trait]
 impl PaymentProvider for PaystackProvider {
     async fn create_payout(&self, req: &PayoutRequest) -> Result<PayoutResult, String> {
+        let span = tracing::info_span!("paystack.create_payout", reference = %req.reference);
+        let _guard = span.enter();
+
         let amount_kobo: i64 = req
             .amount
             .parse()

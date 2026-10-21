@@ -22,6 +22,15 @@ pub enum WithdrawalError {
     Database(#[from] sqlx::Error),
 }
 
+#[tracing::instrument(
+    name = "withdrawals.create_withdrawal",
+    skip(db, provider, withdrawal),
+    fields(
+        merchant_id = %withdrawal.merchant_id,
+        asset = %withdrawal.asset,
+        amount_stroops = withdrawal.amount_stroops,
+    )
+)]
 pub async fn create_withdrawal(
     db: &PgPool,
     provider: &dyn PaymentProvider,
