@@ -3,15 +3,68 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+/// Multi-level admin role used for field-level access control.
+///
+/// - `super_admin`: full access to all admin data
+/// - `support`: PII-heavy endpoints (e.g. user emails), no financial data
+/// - `finance`: financial data (withdrawals, overview balances), no PII
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminRole {
+    SuperAdmin,
+    Support,
+    Finance,
+}
+
+impl AdminRole {
+    /// Parse the `admin_role` claim stored on the user record.
+    ///
+    /// Unknown or missing values fall back to the least-privileged role so a
+    /// misconfigured admin never gains access to sensitive data by default.
+    pub fn from_claim(claim: Option<&str>) -> Self {
+        match claim {
+            Some("super_admin") => AdminRole::SuperAdmin,
+            Some("finance") => AdminRole::Finance,
+            Some("support") => AdminRole::Support,
+            _ => AdminRole::Support,
+        }
+    }
+
+    /// Whether this role may view financial data (withdrawals, overview balances).
+    pub fn can_view_financials(self) -> bool {
+        matches!(self, AdminRole::SuperAdmin | AdminRole::Finance)
+    }
+
+    /// Whether this role may view PII-heavy data (user emails, etc.).
+    pub fn can_view_pii(self) -> bool {
+        matches!(self, AdminRole::SuperAdmin | AdminRole::Support)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct AdminUserRow {
     pub id: Uuid,
     pub email: String,
     pub name: String,
     pub is_admin: bool,
+    pub admin_role: Option<String>,
     pub created_at: DateTime<Utc>,
     pub merchant_id: Option<Uuid>,
     pub merchant_name: Option<String>,
+}
+
+impl AdminUserRow {
+    /// Resolve the caller's admin role from the stored claim.
+    pub fn admin_role(&self) -> AdminRole {
+        AdminRole::from_claim(self.admin_role.as_deref())
+    }
+
+    /// Redact PII fields when the caller's role is not allowed to see them.
+    pub fn redact_for(&mut self, role: AdminRole) {
+        if !role.can_view_pii() {
+            self.email = "[redacted]".to_string();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
