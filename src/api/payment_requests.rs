@@ -1,4 +1,7 @@
 use axum::extract::{Path, Query, State};
+use axum::http::header::CACHE_CONTROL;
+use axum::http::HeaderValue;
+use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -64,7 +67,7 @@ pub async fn create(
 pub async fn get(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> ApiResult<Json<PaymentRequestView>> {
+) -> ApiResult<impl IntoResponse> {
     let pr = payment_requests::payment_request_by_id(&state.db, id)
         .await
         .map_err(internal)?
@@ -75,14 +78,14 @@ pub async fn get(
         .map_err(internal)?
         .ok_or_else(|| internal("payment request references a missing wallet"))?;
 
-    Ok(Json(to_view(&pr, &wallet.address, &wallet.network)))
+    Ok(([(CACHE_CONTROL, no_store())], Json(to_view(&pr, &wallet.address, &wallet.network))))
 }
 
 pub async fn list(
     State(state): State<AppState>,
     auth: AuthUser,
     Query(params): Query<ListParams>,
-) -> ApiResult<Json<Page<PaymentRequestView>>> {
+) -> ApiResult<impl IntoResponse> {
     let merchant_id = auth
         .merchant_id
         .ok_or_else(|| bad_request(ErrorCode::MerchantNotFound, "no merchant associated with this account"))?;
@@ -97,14 +100,22 @@ pub async fn list(
             .await
             .map_err(internal)?;
 
-    Ok(Json(Page::new(
+    let page = Page::new(
         rows.iter().map(row_to_view).collect(),
         limit,
         |v: &PaymentRequestView| Cursor {
             created_at: v.created_at,
             id: v.id,
         },
-    )))
+    );
+
+    Ok(([(CACHE_CONTROL, no_store())], Json(page)))
+}
+
+/// Status is computed at read time (see `effective_status`), so responses must
+/// not be cached: a cached list could report a stale `pending` after expiry.
+fn no_store() -> HeaderValue {
+    HeaderValue::from_static("no-store")
 }
 
 #[derive(serde::Deserialize)]
