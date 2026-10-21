@@ -2,20 +2,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
+use tokio::sync::watch;
 
 use crate::blockchain::stellar::{BlockchainListener, StellarListener};
 use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus};
 use crate::services::{balances, payment_requests, payments, wallets};
 use crate::AppState;
 
-pub async fn run(state: Arc<AppState>, horizon_url: String, poll_interval_secs: u64) {
+pub async fn run(
+    state: Arc<AppState>,
+    horizon_url: String,
+    poll_interval_secs: u64,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let listener = StellarListener::new(horizon_url);
 
     loop {
+        if *shutdown.borrow() {
+            tracing::info!("blockchain worker received shutdown signal, stopping");
+            return;
+        }
+
         if let Err(err) = poll_once(&state.db, &listener).await {
             tracing::warn!(error = %err, "deposit poll failed");
         }
-        tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(poll_interval_secs)) => {}
+            _ = shutdown.changed() => {
+                tracing::info!("blockchain worker received shutdown signal, stopping");
+                return;
+            }
+        }
     }
 }
 
