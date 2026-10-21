@@ -13,8 +13,20 @@ pub struct PaystackProvider {
 
 impl PaystackProvider {
     pub fn new(secret_key: String) -> Self {
+        // Connection pool tuning for production use:
+        // - pool_max_idle_per_host(5): cap idle keep-alive connections per host so
+        //   we don't hoard sockets while still reusing connections under load.
+        // - connection_verbose(false): keep per-connection debug logging off in prod.
+        // - tcp_keepalive(30s): keep long-lived connections from being dropped by
+        //   intermediaries during idle periods.
+        // - connect_timeout(5s): fail fast on unreachable hosts, separate from the
+        //   overall request timeout below.
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
+            .pool_max_idle_per_host(5)
+            .connection_verbose(false)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(5))
             .build()
             .expect("failed to build Paystack HTTP client");
         Self { secret_key, http }
