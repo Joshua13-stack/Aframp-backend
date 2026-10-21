@@ -159,6 +159,14 @@ from `Dockerfile`) with the environment from the checklist below, and run
 `sqlx migrate run` before each release that adds a migration. Keep it to
 **one** process — see [the single-instance constraint](#the-single-instance-constraint).
 
+For authentication IP audit logging, the backend needs the client's address
+from the proxy. Keep Caddy's default `X-Forwarded-For` handling enabled on the
+`reverse_proxy` to the backend; Caddy sets or augments that header and ignores
+untrusted values supplied by the incoming client. If another proxy sits in
+front of Caddy, only configure it as a trusted proxy after restricting which
+network peers can connect to Caddy, so clients cannot forge the address recorded
+in the audit log.
+
 On a VM there's no Worker cron; the process stays up on its own, so no
 keepalive is needed. Point an uptime monitor at `https://<host>/api/health`.
 
