@@ -42,3 +42,10 @@ impl<T> Page<T> {
         Page { data, next_cursor }
     }
 }
+
+/// Parses an optional raw cursor string into a `Cursor`, returning `None`
+/// when the input is absent or malformed. Admin list endpoints use this to
+/// translate the `?cursor=` query parameter into a keyset position.
+pub fn parse_cursor(raw: Option<&str>) -> Option<Cursor> {
+    raw.and_then(Cursor::decode)
+}
