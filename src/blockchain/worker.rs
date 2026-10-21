@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::PgPool;
+use tokio::sync::CancellationToken;
+use tokio::time::{interval, MissedTickBehavior};
 
 use crate::blockchain::stellar::{BlockchainListener, StellarListener};
 use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus};
@@ -30,14 +32,29 @@ fn max_hourly_deposit_stroops() -> i64 {
         .unwrap_or(DEFAULT_MAX_HOURLY_DEPOSIT_STROOPS)
 }
 
-pub async fn run(state: Arc<AppState>, horizon_url: String, poll_interval_secs: u64) {
+pub async fn run(
+    state: Arc<AppState>,
+    horizon_url: String,
+    poll_interval_secs: u64,
+    shutdown: CancellationToken,
+) {
     let listener = StellarListener::new(horizon_url);
 
+    let mut ticker = interval(Duration::from_secs(poll_interval_secs.max(1)));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     loop {
-        if let Err(err) = poll_once(&state.db, &listener).await {
-            tracing::warn!(error = %err, "deposit poll failed");
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!("deposit worker received shutdown signal, exiting");
+                break;
+            }
+            _ = ticker.tick() => {
+                if let Err(err) = poll_once(&state.db, &listener).await {
+                    tracing::warn!(error = %err, "deposit poll failed");
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
     }
 }
 
@@ -186,4 +203,39 @@ async fn process_deposit(db: &PgPool, d: crate::blockchain::stellar::DetectedDep
 
     // TODO: dispatch payment.confirmed webhook.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_exits_when_cancelled() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        // A cancelled token must cause `run` to return promptly rather than
+        // looping forever. We use a long poll interval so the only way the
+        // future can complete is via the cancellation branch.
+        let handle = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_without_state(shutdown.clone(), 3600),
+        )
+        .await;
+
+        assert!(handle.is_ok(), "worker did not exit after cancellation");
+    }
+
+    /// Mirrors the select loop in `run` without requiring a live `AppState`/DB,
+    /// so the cancellation path can be exercised in isolation.
+    async fn run_without_state(shutdown: CancellationToken, poll_interval_secs: u64) {
+        let mut ticker = interval(Duration::from_secs(poll_interval_secs.max(1)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+        }
+    }
 }
