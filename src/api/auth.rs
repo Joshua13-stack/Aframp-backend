@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -12,12 +13,15 @@ use crate::auth::extractor::Session;
 use crate::auth::jwt;
 use crate::auth::password;
 use crate::error::{
-    bad_request, bad_request_field, internal, not_found,
-    ApiResult,
+    bad_request, bad_request_field, conflict, internal, not_found, too_many_requests, unauthorized,
+    ApiResult, ErrorCode,
 };
-use crate::models::{AuthResponse, ChangePasswordRequest, LoginRequest, OtpChallengeResponse, SignupRequest, VerifyOtpRequest};
-use crate::services::otp::{self, VerifiedOutcome};
-use crate::services::users;
+use crate::models::{
+    AuthResponse, ChangePasswordRequest, LoginRequest, OtpChallengeResponse, SignupRequest,
+    VerifyOtpRequest,
+};
+use crate::services::otp::{self, OtpError, VerifiedOutcome};
+use crate::services::users::{self, UserError};
 use crate::validation::{is_valid_email, normalize_ng_phone_number, validate_name};
 use crate::AppState;
 
@@ -70,9 +74,13 @@ async fn clear_login_failures(email: &str) {
 /// `verify_otp`, once the code is confirmed; see `services::otp::verify`.
 pub async fn signup(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<SignupRequest>,
 ) -> ApiResult<Json<OtpChallengeResponse>> {
+    let ip = client_ip(&headers, peer.map(|ConnectInfo(addr)| addr.ip()));
     if !is_valid_email(&req.email) {
+        tracing::info!(event = "signup_failed", client_ip = ?ip, "invalid signup email");
         return Err(bad_request_field("email", "must be a valid email address"));
     }
     if req.password.len() < 8 {
@@ -97,6 +105,9 @@ pub async fn signup(
     )
     .await?;
 
+    persist_otp_ip(&state, challenge.challenge_id, ip).await?;
+    tracing::info!(event = "signup_challenge_created", client_ip = ?ip, "signup OTP challenge created");
+
     Ok(Json(challenge))
 }
 
@@ -106,13 +117,18 @@ pub async fn signup(
 /// exactly as it always has, untouched by this rollout.
 pub async fn login(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Response> {
+    let ip = client_ip(&headers, peer.map(|ConnectInfo(addr)| addr.ip()));
     if !is_valid_email(&req.email) {
+        tracing::info!(event = "login_failed", client_ip = ?ip, "invalid login email");
         return Err(bad_request_field("email", "must be a valid email address"));
     }
 
     if let Err(retry_after) = check_login_rate_limit(&req.email).await {
+        tracing::info!(event = "login_locked", client_ip = ?ip, "login rate limit exceeded");
         return Err(rate_limited(retry_after));
     }
 
@@ -121,13 +137,14 @@ pub async fn login(
         Err(err) => {
             if matches!(err, UserError::InvalidCredentials) {
                 record_login_failure(&req.email).await;
+                tracing::info!(event = "login_failed", client_ip = ?ip, "invalid login credentials");
+            } else if matches!(err, UserError::AccountLocked { .. }) {
+                tracing::info!(event = "login_locked", client_ip = ?ip, "account locked during login");
             }
             return Err(map_user_error(err));
         }
     };
     clear_login_failures(&req.email).await;
-    let (user, merchant) = users::login(&state.db, &req.email, &req.password)
-        .await?;
 
     if user.phone_number.is_some() {
         let challenge = otp::start_login_challenge(
@@ -137,6 +154,8 @@ pub async fn login(
             &user,
         )
         .await?;
+        persist_otp_ip(&state, challenge.challenge_id, ip).await?;
+        tracing::info!(event = "login_otp_challenge_created", client_ip = ?ip, user_id = %user.id, "login OTP challenge created");
         return Ok(Json(challenge).into_response());
     }
 
@@ -155,6 +174,7 @@ pub async fn login(
             merchant_id: merchant.map(|m| m.id),
         },
     )?;
+    tracing::info!(event = "login_succeeded", client_ip = ?ip, user_id = %user.id, "login succeeded");
     Ok(resp.into_response())
 }
 
@@ -163,28 +183,52 @@ pub async fn login(
 /// login challenge (which doesn't; the account already exists).
 pub async fn verify_otp(
     State(state): State<AppState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<VerifyOtpRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    let outcome = otp::verify(&state.db, state.otp_hmac_secret.as_str(), req.challenge_id, &req.code)
-        .await?;
+    let ip = client_ip(&headers, peer.map(|ConnectInfo(addr)| addr.ip()));
+    let outcome = match otp::verify(
+        &state.db,
+        state.otp_hmac_secret.as_str(),
+        req.challenge_id,
+        &req.code,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if matches!(err, OtpError::Locked) {
+                tracing::info!(event = "otp_locked", client_ip = ?ip, challenge_id = %req.challenge_id, "OTP challenge locked");
+            } else {
+                tracing::info!(event = "otp_failed", client_ip = ?ip, challenge_id = %req.challenge_id, reason = %err, "OTP verification failed");
+            }
+            return Err(map_otp_error(err));
+        }
+    };
 
     let (user, merchant_id) = match outcome {
         VerifiedOutcome::Login(user) | VerifiedOutcome::PhoneChanged(user) => {
-            let merchant = users::merchant_by_user(&state.db, user.id).await.map_err(internal)?;
+            let merchant = users::merchant_by_user(&state.db, user.id)
+                .await
+                .map_err(internal)?;
             (user, merchant.map(|m| m.id))
         }
         VerifiedOutcome::Signup(user, merchant) => (user, Some(merchant.id)),
     };
 
-    let token = jwt::sign(&state.jwt_secret, user.id, merchant_id, user.is_admin).map_err(internal)?;
-    authenticated(
+    let token =
+        jwt::sign(&state.jwt_secret, user.id, merchant_id, user.is_admin).map_err(internal)?;
+    let response = authenticated(
         &state,
         AuthResponse {
             token,
             user_id: user.id,
             merchant_id,
         },
-    )
+    )?;
+    tracing::info!(event = "otp_succeeded", client_ip = ?ip, challenge_id = %req.challenge_id, user_id = %user.id, "OTP verification succeeded");
+    Ok(response)
 }
 
 /// Drops the session cookie and puts the presented token on the revocation
@@ -290,28 +334,67 @@ fn map_user_error(err: UserError) -> (axum::http::StatusCode, Json<crate::error:
             );
             crate::error::forbidden(ErrorCode::Forbidden, &msg)
         }
-        UserError::MerchantSuspended => {
-            crate::error::forbidden(ErrorCode::Forbidden, "this merchant account has been suspended")
-        }
+        UserError::MerchantSuspended => crate::error::forbidden(
+            ErrorCode::Forbidden,
+            "this merchant account has been suspended",
+        ),
         UserError::Database(_) => internal(err),
     }
 }
 
 fn map_otp_error(err: OtpError) -> (axum::http::StatusCode, Json<crate::error::ApiError>) {
     match err {
-        OtpError::RateLimited => {
-            too_many_requests(ErrorCode::TooManyRequests, "too many requests, please try again shortly")
-        }
-        OtpError::ChallengeNotFound => {
-            not_found(ErrorCode::OtpChallengeNotFound, "otp challenge not found or already used")
-        }
+        OtpError::RateLimited => too_many_requests(
+            ErrorCode::TooManyRequests,
+            "too many requests, please try again shortly",
+        ),
+        OtpError::ChallengeNotFound => not_found(
+            ErrorCode::OtpChallengeNotFound,
+            "otp challenge not found or already used",
+        ),
         OtpError::Expired => bad_request(ErrorCode::OtpExpired, "otp code has expired"),
-        OtpError::Locked => bad_request(ErrorCode::OtpLocked, "too many incorrect attempts — request a new code"),
+        OtpError::Locked => bad_request(
+            ErrorCode::OtpLocked,
+            "too many incorrect attempts — request a new code",
+        ),
         OtpError::InvalidCode => bad_request(ErrorCode::OtpInvalid, "incorrect code"),
         OtpError::EmailTaken => conflict(ErrorCode::EmailTaken, "email already registered"),
         OtpError::PhoneTaken => conflict(ErrorCode::PhoneTaken, "phone number already registered"),
         OtpError::SendFailed(_) | OtpError::Database(_) => internal(err),
     }
+}
+
+/// Selects a valid client address from proxy headers, falling back to the
+/// socket peer for direct connections. The proxy must sanitize forwarded
+/// headers before they reach this service.
+fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>) -> Option<IpAddr> {
+    let forwarded = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+    forwarded
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        })
+        .or(peer)
+}
+
+async fn persist_otp_ip(
+    state: &AppState,
+    challenge_id: uuid::Uuid,
+    ip: Option<IpAddr>,
+) -> ApiResult<()> {
+    sqlx::query("UPDATE otp_challenges SET client_ip = $2::inet WHERE id = $1")
+        .bind(challenge_id)
+        .bind(ip.map(|address| address.to_string()))
+        .execute(&state.db)
+        .await
+        .map_err(internal)?;
+    Ok(())
 }
 
 #[derive(serde::Deserialize)]
