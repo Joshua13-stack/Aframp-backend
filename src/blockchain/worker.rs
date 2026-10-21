@@ -8,6 +8,28 @@ use crate::models::{NewPayment, UpdateBalance, UpdatePaymentStatus};
 use crate::services::{balances, payment_requests, payments, wallets};
 use crate::AppState;
 
+/// Default per-merchant single-deposit threshold (in stroops) used when the
+/// `MAX_SINGLE_DEPOSIT_STROOPS` environment variable is not set.
+const DEFAULT_MAX_SINGLE_DEPOSIT_STROOPS: i64 = 100_000_000_000; // 10,000 XLM
+
+/// Default per-merchant hourly aggregate threshold (in stroops) used when the
+/// `MAX_HOURLY_DEPOSIT_STROOPS` environment variable is not set.
+const DEFAULT_MAX_HOURLY_DEPOSIT_STROOPS: i64 = 500_000_000_000; // 50,000 XLM
+
+fn max_single_deposit_stroops() -> i64 {
+    std::env::var("MAX_SINGLE_DEPOSIT_STROOPS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_MAX_SINGLE_DEPOSIT_STROOPS)
+}
+
+fn max_hourly_deposit_stroops() -> i64 {
+    std::env::var("MAX_HOURLY_DEPOSIT_STROOPS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_MAX_HOURLY_DEPOSIT_STROOPS)
+}
+
 pub async fn run(state: Arc<AppState>, horizon_url: String, poll_interval_secs: u64) {
     let listener = StellarListener::new(horizon_url);
 
@@ -63,6 +85,48 @@ async fn process_deposit(db: &PgPool, d: crate::blockchain::stellar::DetectedDep
 
     if payment.status != "detected" {
         return Ok(());
+    }
+
+    // Anomaly detection: flag unusually large single deposits or hourly bursts.
+    // The deposit is still credited below; flagging only raises an alert.
+    let mut flagged = false;
+    let single_threshold = max_single_deposit_stroops();
+    if d.amount_stroops > single_threshold {
+        flagged = true;
+        tracing::warn!(
+            merchant_id = %wallet.merchant_id,
+            amount_stroops = d.amount_stroops,
+            tx_hash = %d.tx_hash,
+            threshold = single_threshold,
+            "SECURITY: deposit exceeds MAX_SINGLE_DEPOSIT_STROOPS"
+        );
+    }
+
+    let hourly_threshold = max_hourly_deposit_stroops();
+    match payments::sum_recent_deposits_stroops(db, wallet.merchant_id, 3600).await {
+        Ok(recent_total) => {
+            let projected = recent_total.saturating_add(d.amount_stroops);
+            if projected > hourly_threshold {
+                flagged = true;
+                tracing::warn!(
+                    merchant_id = %wallet.merchant_id,
+                    amount_stroops = d.amount_stroops,
+                    hourly_total_stroops = projected,
+                    tx_hash = %d.tx_hash,
+                    threshold = hourly_threshold,
+                    "SECURITY: deposit exceeds MAX_HOURLY_DEPOSIT_STROOPS"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to compute hourly deposit total");
+        }
+    }
+
+    if flagged {
+        payments::flag_payment(db, payment.id)
+            .await
+            .map_err(|e| e.to_string())?;
     }
 
     payments::set_status(db, payment.id, UpdatePaymentStatus::Verified)
