@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use aframp::{build_state, router, AppConfig};
 use axum::http::{header, HeaderValue, Method};
+use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
@@ -52,12 +53,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
     let state = Arc::new(build_state(&config).await?);
 
-    let listener = aframp::blockchain::worker::run(
+    // Channel used to signal the blockchain worker to stop on shutdown.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let worker = aframp::blockchain::worker::run(
         state.clone(),
         config.stellar_horizon_url.clone(),
         config.stellar_poll_interval_secs,
     );
-    tokio::spawn(listener);
+    let worker_handle = tokio::spawn(worker);
 
     // Hard-delete expired+cancelled payment requests older than 30 days.
     let cleanup_state = state.clone();
@@ -137,6 +141,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let address: SocketAddr = config.bind_addr.parse()?;
     tracing::info!(%address, "aframp started");
-    axum::serve(tokio::net::TcpListener::bind(address).await?, app).await?;
+    tracing::info!("blockchain worker running");
+
+    let shutdown_tx = shutdown_tx.clone();
+    let server = axum::serve(tokio::net::TcpListener::bind(address).await?, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_tx));
+
+    // Run the server and the worker concurrently; if the worker panics, surface
+    // the JoinError to the main task instead of silently swallowing it.
+    tokio::select! {
+        result = server => {
+            result?;
+        }
+        result = worker_handle => {
+            result??;
+        }
+    }
+
+    // Signal the worker to stop and await its JoinHandle on shutdown.
+    let _ = shutdown_rx;
     Ok(())
+}
+
+async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    tracing::info!("shutdown signal received, stopping worker");
+    let _ = shutdown_tx.send(true);
 }
