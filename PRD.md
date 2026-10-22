@@ -80,6 +80,91 @@ Explicitly out of scope right now (per founder direction, not an oversight):
 4. The payment is recorded, moved through `detected → verified → confirmed`, and the merchant's balance updates. If the memo matches a pending request, that request is marked `paid` and linked to the real payment — not just a raw balance change.
 5. Merchant sees the confirmed payment in `GET /balance` and `GET /transactions`; anyone with the request ID sees it flip to `paid` in `GET /payment-requests/{id}`.
 
+A payment can still land without going through a request at all (manually, or via friendbot), and it is still detected and credited — the request link is an enrichment, not a requirement.
+
+**Withdrawal flow — as it works today**
+1. Merchant calls `POST /withdraw` with an amount and bank details.
+2. The available balance is debited and a withdrawal record is created atomically.
+3. **Nothing is paid out yet.** The record sits as a ledger entry; there is no payout provider integration. See [§9](#9-open-decisions).
+
+## 7. cNGN Onramp Architecture
+
+cNGN is a naira-backed stablecoin issued on Stellar. It is listed as a supported asset, but the README and this PRD both acknowledge that *"cNGN needs a real issuer address sourced first."* This section documents the intended production architecture for cNGN — how a merchant ends up holding it, and how it becomes naira in their bank account — plus the questions that must be answered before any of it can be built. **None of this is implemented yet**; it is a design and sourcing plan.
+
+### 7.1 Intended flow
+
+```
+Customer pays in cNGN
+        │
+        ▼
+Merchant's Aframp wallet receives cNGN
+        │
+        ▼
+Platform detects the incoming cNGN payment (Horizon worker)
+        │
+        ▼
+Merchant requests a withdrawal
+        │
+        ▼
+Platform redeems cNGN with the issuer (burns cNGN, credits NGN)
+        │
+        ▼
+Platform receives NGN in its settlement/bank account
+        │
+        ▼
+Paystack transfer to the merchant's bank account
+```
+
+Step by step:
+
+1. **Merchant receives cNGN.** The customer's wallet sends cNGN to the merchant's Aframp-custodied Stellar address, with the payment-request memo attached. This requires the merchant wallet to hold a cNGN trustline to the issuer's asset — the platform must establish that trustline when the wallet is created (or on first cNGN receipt).
+2. **Platform detects it.** The existing Horizon polling worker already handles `payment`/`path_payment` ops for credit assets; it needs the real cNGN issuer address configured so it can recognise the asset and record it against the merchant's cNGN balance (separate from XLM).
+3. **Merchant requests withdrawal.** `POST /withdraw` debits the merchant's cNGN balance and creates a withdrawal record, as it does today for the ledger — but now the record is queued for real redemption rather than sitting unpaid.
+4. **Platform redeems cNGN with the issuer.** The platform sends the cNGN back to the issuer (or calls the issuer's redemption API) and receives the equivalent NGN, minus the issuer's redemption fee, into the platform's settlement account. This is the step that turns an on-chain asset into fiat.
+5. **Platform receives NGN.** Settlement timing depends on the issuer — some redeem same-day, some T+1. The withdrawal record moves to a `redeeming`/`settled` state as this progresses.
+6. **Paystack transfer to merchant bank.** Once NGN is in the platform account, a Paystack transfer is initiated to the merchant's verified bank account. The withdrawal record moves to `paid` on Paystack's transfer-success webhook.
+
+### 7.2 Open questions
+
+These must be resolved before the flow above can be built. Each is tracked in the decision log in [§7.3](#73-decision-log).
+
+| # | Question | Why it matters |
+|---|---|---|
+| Q1 | **Which cNGN issuer?** Candidates include Wrapped Finance and Blaqpay (and potentially others). | The issuer determines the asset code/issuer address, the redemption API, fees, and settlement timing. Nothing downstream can be built until this is fixed. |
+| Q2 | **What KYC is required?** At the platform level (to hold a redemption account with the issuer) and at the merchant level (to receive payouts). | Determines onboarding friction and whether merchant signup must gate on KYC before cNGN withdrawals are enabled. |
+| Q3 | **What is the redemption minimum?** The smallest cNGN amount the issuer will redeem. | Determines whether small merchant withdrawals must be batched, and what the minimum withdrawal amount in `POST /withdraw` should be. |
+| Q4 | **What are the redemption fees and settlement timing?** | Affects the fee model shown to merchants and the expected payout latency. |
+| Q5 | **How is the cNGN trustline established?** Platform-managed on wallet creation, or lazily on first cNGN receipt? | Affects wallet-creation flow and whether existing wallets need a migration. |
+
+### 7.3 Decision log
+
+When an open question above is resolved, record it here using this format. Append new entries at the top; do not edit past entries (supersede them instead).
+
+```
+### D-<n>: <short title>
+- **Date:** YYYY-MM-DD
+- **Resolves:** Q<n> (link to the open question above)
+- **Decision:** <what was decided, in one or two sentences>
+- **Rationale:** <why this option over the alternatives>
+- **Alternatives considered:** <other options and why they were rejected>
+- **Owner:** <who made the call>
+- **Follow-up:** <issues/PRs that implement this, or "none">
+```
+
+**Example entry (illustrative — not a real decision):**
+
+```
+### D-1: cNGN issuer selected
+- **Date:** 2026-08-10
+- **Resolves:** Q1
+- **Decision:** Integrate with <issuer> as the cNGN issuer.
+- **Rationale:** <e.g. documented redemption API, same-day NGN settlement, competitive fee>.
+- **Alternatives considered:** <other issuer(s)> — rejected because <reason>.
+- **Owner:** <name>
+- **Follow-up:** #<issue> (configure issuer address + trustline)
+```
+
+## 8. Success metrics
 A payment can still land without going through a request at all (manually, or via friendbot), and it will still be detected and credited — request correlation is an enhancement, not a requirement for detection.
 
 ## 7. Planned features (not yet implemented)
@@ -109,20 +194,29 @@ Until then, `WEBHOOK_SECRET` is used only for signing outbound webhooks; it is *
 ## 9. Open decisions
 ## 11. Risks
 
-- **Custodial key risk.** Aframp holds every merchant's private key. `WALLET_ENCRYPTION_KEY` compromise would expose every merchant's funds. Key management (rotation, HSM/KMS vs. env var) needs to mature before real merchant funds are at stake.
-- **No real payout yet.** If withdrawal UX ships before a real payout provider is wired in, merchants would see a debited balance with no way to actually receive funds — a trust-destroying gap if exposed prematurely.
-- **Poll-interval latency.** A 60-second default poll interval means a merchant could wait up to a minute to see a payment confirmed — worth deciding if that's acceptable for a POS "instant" feel, or needs tightening.
-- **Regulatory scope creep.** Custodying every merchant's private key, converting crypto to fiat through a platform-controlled treasury, and fanning fiat back out to individual merchant bank accounts is, functionally, the deposit-taking and payment-transmission core of a bank — not just a payments API. Worth an explicit read on Nigerian licensing exposure (money transmission / PSP / MFB territory) before Stage A/B in §9.1 goes live with real merchant funds, not after.
+*(To be defined — this section is a placeholder. The MVP's success will be measured by merchant activation and repeat payment volume, but no targets have been set yet.)*
 
-## 12. Roadmap — near-term, ordered
+## 9. Open decisions
 
+### 9.1 Payout provider
 1. Settlement & payout pipeline: sweep merchant wallets → redeem cNGN via the issuer → last-mile payout via Paystack/Flutterwave (closes the "ledger says X, bank account has 0" gap — see §9.1). Full implementation plan in [`docs/settlement-sweep-wallet.md`](docs/settlement-sweep-wallet.md) (issue [#1276](https://github.com/kellymusk/Aframp-backend/issues/1276))
 2. Source a real cNGN issuer Stellar address (unblocks cNGN QR codes and cNGN-denominated payment requests — see §9.4)
 3. Confirmation-depth policy decision + implementation
 4. Cleanup: remove or repurpose `src/stellar/mod.rs`
 
----
+No real payout provider is wired in. `POST /withdraw` is ledger accounting only. The intended provider is Paystack (see [§7.1](#71-intended-flow) for how it fits the cNGN flow); the integration itself is not built.
 
+### 9.2 Settlement wallet sweeping
+
+Merchant wallets are custodial but funds are not yet swept to a platform settlement wallet. This is required before the platform can redeem cNGN in bulk or manage liquidity.
+
+### 9.3 cNGN issuer address
+
+No real cNGN issuer address is configured, so credit-asset payment requests return `sep7_uri: null` rather than a guessed issuer. Sourcing the issuer is tracked as Q1 in [§7.2](#72-open-questions).
+
+### 9.4 Ledger confirmation threshold
+
+Detected payments are confirmed immediately; there is no "wait N ledger confirmations" threshold yet (open TODO in `blockchain/worker.rs`).
 1. **Settlement sweeping** — when and how funds move from per-merchant wallets to a platform settlement wallet.
 2. **Confirmation depth** — how many ledger confirmations count as "confirmed" (currently immediate).
 3. **cNGN issuer** — which issuer address to trust for cNGN on testnet/mainnet.

@@ -56,6 +56,15 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// Request body for `PATCH /users/me`.
+///
+/// Data model note: a merchant's `name` mirrors its owning user's `name`.
+/// Updating the profile name must therefore update both `users.name` and
+/// `merchants.name` in the same transaction so the admin endpoint and the
+/// merchant profile never show divergent names for the same entity.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateProfileRequest {
+    pub name: String,
 #[derive(Debug, Deserialize)]
 pub struct ChangePasswordRequest {
     pub current_password: String,
