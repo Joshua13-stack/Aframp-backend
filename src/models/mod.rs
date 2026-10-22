@@ -16,6 +16,9 @@ pub use admin::{
     AdminMerchantRow, AdminOverview, AdminPaymentRequestRow, AdminTransactionRow, AdminUserRow,
     AdminWalletRow, AdminWithdrawalRow, AssetTotal, StatusCount,
 };
+// NOTE: `ApiKey` is intentionally not re-exported. The `api_keys` table and
+// `ApiKey` model are planned infrastructure for a future API key system and are
+// not yet wired to any endpoints. See PRD.md (planned features).
 pub use api_key::ApiKey;
 pub use list_params::{
     ListParams, ADMIN_DEFAULT_LIMIT, ADMIN_MAX_LIMIT, MERCHANT_DEFAULT_LIMIT, MERCHANT_MAX_LIMIT,

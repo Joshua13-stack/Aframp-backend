@@ -80,54 +80,33 @@ Explicitly out of scope right now (per founder direction, not an oversight):
 4. The payment is recorded, moved through `detected → verified → confirmed`, and the merchant's balance updates. If the memo matches a pending request, that request is marked `paid` and linked to the real payment — not just a raw balance change.
 5. Merchant sees the confirmed payment in `GET /balance` and `GET /transactions`; anyone with the request ID sees it flip to `paid` in `GET /payment-requests/{id}`.
 
-A payment can still land without going through a request at all (manually, or via friendbot on testnet) — it's recorded and confirmed exactly as before, it just has nothing to correlate against, which is unchanged, additive behavior.
+A payment can still land without going through a request at all (manually, or via friendbot), and it will still be detected and credited — request correlation is an enhancement, not a requirement for detection.
 
-**Withdrawal flow — as it works today**
-1. Merchant requests a withdrawal (`POST /withdraw`) with a bank account.
-2. Available balance is debited immediately; a `pending` withdrawal record is created.
-3. **Nothing pays out.** This is the biggest gap between "the ledger says X" and "the merchant has X in their bank account." See [§9](#9-open-decisions).
+## 7. Planned features (not yet implemented)
 
-## 7. System design (current)
+These are tracked here so the schema and models that anticipate them aren't mistaken for dead code. Nothing in this section is wired to an endpoint yet.
 
-- **Custody model:** custodial. Aframp generates and holds every merchant's Stellar private key, AES-256-GCM encrypted at rest (`WALLET_ENCRYPTION_KEY`). Merchants never see or manage a seed phrase.
-- **Deposit detection:** poll-based, not event-streamed. A background worker queries Horizon's per-account payments feed for every wallet in the database on a fixed interval. This is simple and has been proven correct, but doesn't scale indefinitely — see [§9](#9-open-decisions).
-- **Ledger:** Postgres is the source of truth for merchant-facing balance, not the Stellar ledger directly. Balance changes only ever originate from a detected, successful Stellar operation.
-- **Auth:** every endpoint that touches merchant data or money requires a valid JWT, enforced structurally via an Axum extractor (the handler cannot compile without it) — not a per-handler check that could be forgotten.
-- **What's explicitly *not* built:** outbound Stellar transaction construction/signing (Aframp never signs a payment itself — customers always pay from their own wallet), a settlement/sweep wallet, any real payout provider funding (Stage A), a real cNGN issuer address (blocks cNGN QR codes specifically).
+### 7.1 API key authentication
 
-## 8. Current status ledger
+The `0001_init.sql` migration creates an `api_keys` table and `src/models/api_key.rs` defines an `ApiKey` model, but **no API key endpoints exist yet** — there is no way to create, list, or revoke a key, and no request path authenticates via API key. This is planned infrastructure for the Aframp API layer (third-party fintech integrations), not a working feature.
 
-A condensed view of what's verified vs. still a stub, independent of the MVP numbering above — see the repository [`README.md`](README.md) for the full version with proof points.
+Planned scope (tracked separately, including multi-environment keys):
 
-**✅ Verified working today:** merchant signup/login, universal auth enforcement, real Stellar wallet generation, encrypted key custody, real Stellar deposit detection (proven with an actual testnet transaction), balance ledger, transaction history, payment request generation + SEP-0007 QR for XLM, memo-based payment-to-request correlation, withdrawal request + ledger accounting, Paystack Transfers wired into `/withdraw` and live-tested against three distinct real failure modes.
+- `POST /api-keys` to mint a key for the authenticated merchant
+- `GET /api-keys` to list a merchant's keys (without exposing the secret)
+- `DELETE /api-keys/{id}` to revoke a key
+- API-key authentication as an alternative to JWT on merchant endpoints
+- Multi-environment keys (e.g. test vs. live) — see the related issue
 
-**🚧 Genuine gaps:** real payout funding (Stage A — no money can currently leave the system, see §9.1), real cNGN issuer address (blocks cNGN QR codes and cNGN-denominated payment requests from being scannable), confirmation-depth threshold (currently immediate), settlement/sweep wallet, and one piece of vestigial dead code (`src/stellar/mod.rs`, from an abandoned memo-based design) still sitting in the tree as cleanup debt.
+Until then, `WEBHOOK_SECRET` is used only for signing outbound webhooks; it is **not** an API key authentication mechanism.
+
+## 8. Success metrics
+
+- A merchant can go from signup to a confirmed, memo-correlated payment without leaving the API.
+- Every confirmed payment is traceable to a real Stellar transaction hash.
+- No merchant ever sees a balance that isn't backed by a detected on-chain deposit minus recorded withdrawals.
 
 ## 9. Open decisions
-
-These are real product/engineering decisions that need an answer before the next phase of work, not implementation details we can quietly decide alone:
-
-1. **Settlement & payout pipeline.** Originally tracked as two separate questions — a payout provider, and whether to sweep merchant wallets — research into cNGN's own redemption mechanics showed these are actually one two-stage pipeline, not independent choices:
-   - **Stage A — crypto → fiat conversion.** Merchant Stellar wallets get swept into an Aframp-controlled platform wallet, which periodically redeems cNGN for real NGN via the cNGN issuer (WrappedCBDC, `docs.cngn.co`). This is the piece the issuer directly solves — but it only pays out to a small set of **pre-whitelisted** Aframp-owned bank accounts, and whitelisting a new destination carries a **24-hour timelock**. That rules it out as a same-day, per-merchant payout mechanism on its own.
-   - **Stage B — fiat → individual merchant payout.** Once Aframp holds real NGN, a last-mile rail fans it out to each merchant's own bank account on demand. Paystack Transfers fits this specifically (resolve account → create recipient → initiate transfer → OTP finalize in live mode), as would Flutterwave or a direct NIBSS integration. Paystack requires a **Registered** (not Starter) business with compliance docs submitted before Transfers unlock at all — real lead time worth starting early, independent of when the code gets written.
-
-   Still open within this: which last-mile provider (compare fees and payout speed across Paystack/Flutterwave), and how Stage A redemption is triggered (batched on a schedule, or fired once a platform-wallet balance threshold is crossed).
-
-   **Stage B is now wired and live-tested against Paystack's real test-mode API** (`services/withdrawals.rs` calls a real `PaystackProvider`, not a stub). That testing produced empirical, not theoretical, confirmation of the Stage A dependency: with a real bank account and a valid amount, the transfer still failed with *"Your balance is not enough to fulfil this request"* — Paystack's `source: "balance"` transfers draw from NGN Paystack already holds for Aframp, and there is currently no way to get money into that balance. Paystack's own docs state settlements aren't processed in test mode at all, so this can't be worked around from the API side — Stage A (or an equivalent real funding source) is a hard prerequisite for Stage B to ever return a real `success`, not just a nice-to-have ordering.
-2. **Confirmation-depth policy.** Stellar has fast finality (~5s), so "wait N confirmations" matters less than on Bitcoin — but "immediate" still means zero protection against a reorg edge case. Needs an explicit policy, even if the answer is "confirm immediately is fine, here's why."
-3. ~~**Payment request / QR payload format.**~~ **Resolved:** SEP-0007 `web+stellar:pay` URIs, implemented and live-verified for XLM. Still genuinely open underneath this: cNGN requests can't get a real QR until there's a real cNGN issuer Stellar address to put in the URI — a guessed one would silently misdirect a customer's payment, so `sep7_uri` is `null` for cNGN today rather than wrong. This is really the same missing piece as the asset-scope question below.
-4. **Asset scope, including a real cNGN issuer address.** Today deposit detection recognizes any asset Horizon reports (native XLM or credit assets by code), and payment requests default to XLM specifically because it's what's actually scannable right now. Is cNGN the only supported asset at launch, or does XLM stay first-class? Whichever way that's answered, a real cNGN issuer Stellar address needs to be sourced before cNGN payment requests, QR codes, or deposit handling can be considered complete rather than partially stubbed.
-5. **Poll-based detection scaling.** Works today with a handful of wallets. At what wallet count does polling-per-address on a fixed interval become a bottleneck, and is the answer a smarter cursor/backoff strategy, or a move to Horizon's streaming (SSE) API?
-
-## 10. Success metrics (proposed — pending confirmation)
-
-No target numbers exist yet from the business side; these are proposed instrumentation points worth deciding on, not committed targets:
-
-- Time from signup to first wallet created
-- Time from a real deposit landing on-chain to it appearing in `/balance` (currently bounded by `STELLAR_POLL_INTERVAL_SECS`, default 60s)
-- Withdrawal request → real payout completion time (once a provider is wired in)
-- Signup → wallet → first deposit → first withdrawal funnel completion rate
-
 ## 11. Risks
 
 - **Custodial key risk.** Aframp holds every merchant's private key. `WALLET_ENCRYPTION_KEY` compromise would expose every merchant's funds. Key management (rotation, HSM/KMS vs. env var) needs to mature before real merchant funds are at stake.
@@ -144,4 +123,8 @@ No target numbers exist yet from the business side; these are proposed instrumen
 
 ---
 
-*This document should be updated alongside the codebase as decisions in §9 get made and roadmap items in §12 land — treat status claims here the way `README.md`'s status section is treated: nothing marked done that hasn't actually been verified.*
+1. **Settlement sweeping** — when and how funds move from per-merchant wallets to a platform settlement wallet.
+2. **Confirmation depth** — how many ledger confirmations count as "confirmed" (currently immediate).
+3. **cNGN issuer** — which issuer address to trust for cNGN on testnet/mainnet.
+4. **Payout provider** — which provider actually moves fiat for withdrawals.
+5. **API key environments** — whether keys are scoped per environment or per merchant (see [§7.1](#71-api-key-authentication)).
