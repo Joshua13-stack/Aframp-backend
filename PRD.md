@@ -107,6 +107,21 @@ Until then, `WEBHOOK_SECRET` is used only for signing outbound webhooks; it is *
 - No merchant ever sees a balance that isn't backed by a detected on-chain deposit minus recorded withdrawals.
 
 ## 9. Open decisions
+## 11. Risks
+
+- **Custodial key risk.** Aframp holds every merchant's private key. `WALLET_ENCRYPTION_KEY` compromise would expose every merchant's funds. Key management (rotation, HSM/KMS vs. env var) needs to mature before real merchant funds are at stake.
+- **No real payout yet.** If withdrawal UX ships before a real payout provider is wired in, merchants would see a debited balance with no way to actually receive funds — a trust-destroying gap if exposed prematurely.
+- **Poll-interval latency.** A 60-second default poll interval means a merchant could wait up to a minute to see a payment confirmed — worth deciding if that's acceptable for a POS "instant" feel, or needs tightening.
+- **Regulatory scope creep.** Custodying every merchant's private key, converting crypto to fiat through a platform-controlled treasury, and fanning fiat back out to individual merchant bank accounts is, functionally, the deposit-taking and payment-transmission core of a bank — not just a payments API. Worth an explicit read on Nigerian licensing exposure (money transmission / PSP / MFB territory) before Stage A/B in §9.1 goes live with real merchant funds, not after.
+
+## 12. Roadmap — near-term, ordered
+
+1. Settlement & payout pipeline: sweep merchant wallets → redeem cNGN via the issuer → last-mile payout via Paystack/Flutterwave (closes the "ledger says X, bank account has 0" gap — see §9.1). Full implementation plan in [`docs/settlement-sweep-wallet.md`](docs/settlement-sweep-wallet.md) (issue [#1276](https://github.com/kellymusk/Aframp-backend/issues/1276))
+2. Source a real cNGN issuer Stellar address (unblocks cNGN QR codes and cNGN-denominated payment requests — see §9.4)
+3. Confirmation-depth policy decision + implementation
+4. Cleanup: remove or repurpose `src/stellar/mod.rs`
+
+---
 
 1. **Settlement sweeping** — when and how funds move from per-merchant wallets to a platform settlement wallet.
 2. **Confirmation depth** — how many ledger confirmations count as "confirmed" (currently immediate).
