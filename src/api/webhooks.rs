@@ -1,10 +1,145 @@
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::Json;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use crate::error::{forbidden, ApiResult, ErrorCode};
+use crate::auth::extractor::AuthUser;
+use crate::error::{bad_request, forbidden, not_found, ApiResult, ErrorCode};
 use crate::otp::termii::TermiiWebhookEvent;
 use crate::AppState;
+
+/// Known event types a merchant may subscribe to.
+const KNOWN_EVENTS: &[&str] = &["payment.confirmed", "payment.failed", "payment.refunded"];
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSubscriptionRequest {
+    pub url: String,
+    pub events: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubscriptionResponse {
+    pub id: Uuid,
+    pub merchant_id: Uuid,
+    pub url: String,
+    pub events: Vec<String>,
+    pub active: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn validate_url(url: &str) -> ApiResult<()> {
+    if !url.starts_with("https://") || url.len() <= "https://".len() {
+        return Err(bad_request(
+            ErrorCode::InvalidRequest,
+            "webhook url must be a valid HTTPS URL",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_events(events: &[String]) -> ApiResult<()> {
+    if events.is_empty() {
+        return Err(bad_request(
+            ErrorCode::InvalidRequest,
+            "at least one event is required",
+        ));
+    }
+    for event in events {
+        if !KNOWN_EVENTS.contains(&event.as_str()) {
+            return Err(bad_request(
+                ErrorCode::InvalidRequest,
+                "unknown webhook event type",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Create a webhook subscription for the authenticated merchant.
+pub async fn create_subscription(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(payload): Json<CreateSubscriptionRequest>,
+) -> ApiResult<(StatusCode, Json<SubscriptionResponse>)> {
+    validate_url(&payload.url)?;
+    validate_events(&payload.events)?;
+
+    let secret_hash = state.webhook_secret_hash(&payload.url);
+
+    let row = sqlx::query_as::<_, (Uuid, Uuid, String, Vec<String>, bool, chrono::DateTime<chrono::Utc>)>(
+        "INSERT INTO webhook_subscriptions (merchant_id, url, events, secret_hash, active) \
+         VALUES ($1, $2, $3, $4, TRUE) \
+         RETURNING id, merchant_id, url, events, active, created_at",
+    )
+    .bind(auth.merchant_id)
+    .bind(&payload.url)
+    .bind(&payload.events)
+    .bind(&secret_hash)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(SubscriptionResponse {
+            id: row.0,
+            merchant_id: row.1,
+            url: row.2,
+            events: row.3,
+            active: row.4,
+            created_at: row.5,
+        }),
+    ))
+}
+
+/// List the authenticated merchant's webhook subscriptions.
+pub async fn list_subscriptions(
+    State(state): State<AppState>,
+    auth: AuthUser,
+) -> ApiResult<Json<Vec<SubscriptionResponse>>> {
+    let rows = sqlx::query_as::<_, (Uuid, Uuid, String, Vec<String>, bool, chrono::DateTime<chrono::Utc>)>(
+        "SELECT id, merchant_id, url, events, active, created_at \
+         FROM webhook_subscriptions WHERE merchant_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(auth.merchant_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| SubscriptionResponse {
+                id: row.0,
+                merchant_id: row.1,
+                url: row.2,
+                events: row.3,
+                active: row.4,
+                created_at: row.5,
+            })
+            .collect(),
+    ))
+}
+
+/// Delete a webhook subscription owned by the authenticated merchant.
+pub async fn delete_subscription(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let result = sqlx::query(
+        "DELETE FROM webhook_subscriptions WHERE id = $1 AND merchant_id = $2",
+    )
+    .bind(id)
+    .bind(auth.merchant_id)
+    .execute(&state.db)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(not_found(ErrorCode::NotFound, "subscription not found"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
 
 /// Termii's delivery-status webhook (SMS sent/delivered/failed/etc. — see
 /// https://developers.termii.com/events-and-reports). Register this URL at

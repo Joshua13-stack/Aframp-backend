@@ -9,6 +9,7 @@ mod payment_request;
 pub mod status;
 mod user;
 mod wallet;
+mod webhook_subscription;
 mod withdrawal;
 
 pub use admin::{
@@ -32,4 +33,8 @@ pub use user::{AuthResponse, ChangePasswordRequest, LoginRequest, NewUser, Signu
 pub use status::{PaymentRequestStatus, PaymentStatus, WithdrawalStatus};
 pub use user::{AuthResponse, LoginRequest, NewUser, SignupRequest, User};
 pub use wallet::{CreateWalletRequest, NewWallet, Wallet};
+pub use webhook_subscription::{
+    CreateWebhookSubscriptionRequest, NewWebhookSubscription, WebhookSubscription,
+};
+pub use withdrawal::{CreateWithdrawalRequest, NewWithdrawal, Withdrawal};
 pub use withdrawal::{CreateWithdrawalRequest, NewWithdrawal, Withdrawal};

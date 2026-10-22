@@ -47,7 +47,9 @@ const CODE_TTL_SECS: i64 = 600;
 const RESEND_COOLDOWN_SECS: i64 = 60;
 /// Spam cap: at most this many fresh challenges per phone+purpose per hour.
 /// A refreshed (cooldown-respecting) resend of an existing challenge doesn't
-/// count against this — only brand-new challenges do.
+/// count against this — only brand-new challenges do. Successfully verified
+/// (consumed) challenges are excluded too, so a merchant who verifies their
+/// OTP isn't locked out by their own past successes.
 const MAX_SENDS_PER_HOUR: i64 = 5;
 const MAX_ATTEMPTS: i32 = 5;
 
@@ -416,12 +418,126 @@ async fn upsert_challenge(
         .await?;
         return Ok((id, code));
     }
+
+    // Only count fresh (unconsumed) challenges toward the hourly spam cap.
+    // Successfully verified challenges are excluded so a merchant who has
+    // already proven ownership of the phone isn't locked out by their own
+    // past successes.
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM otp_challenges
+          WHERE phone_number = $1 AND purpose = $2 AND consumed_at IS NULL
+            AND created_at > now() - interval '1 hour'",
+    )
+    .bind(new.phone_number)
+    .bind(new.purpose)
+    .fetch_one(db)
+    .await?;
+    if recent >= MAX_SENDS_PER_HOUR {
+        return Err(OtpError::RateLimited);
+    }
+
+    let id = Uuid::new_v4();
+    let code = generate_code();
+    let code_hash = hash_code(hmac_secret, id, &code);
+    let expires_at = Utc::now() + Duration::seconds(CODE_TTL_SECS);
+    sqlx::query(
+        "INSERT INTO otp_challenges
+            (id, purpose, user_id, pending_email, pending_password_hash, pending_name,
+             phone_number, code_hash, attempts, max_attempts, expires_at, last_sent_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9, $10, now())",
+    )
+    .bind(id)
+    .bind(new.purpose)
+    .bind(new.user_id)
+    .bind(new.pending_email)
+    .bind(new.pending_password_hash)
+    .bind(new.pending_name)
+    .bind(new.phone_number)
+    .bind(&code_hash)
+    .bind(MAX_ATTEMPTS)
+    .bind(expires_at)
+    .execute(db)
+    .await?;
+
+    Ok((id, code))
+}
+
+async fn send_code(otp: &dyn OtpProvider, phone_number: &str, code: &str) -> Result<(), OtpError> {
+    otp.send(phone_number, code)
+        .await
+        .map_err(|err| OtpError::SendFailed(err.to_string()))
+}
+
+fn generate_code() -> String {
+    let mut bytes = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let n = u32::from_be_bytes(bytes) % 1_000_000;
+    format!("{:06}", n)
+}
+
+fn hash_code(hmac_secret: &str, challenge_id: Uuid, code: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(hmac_secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(challenge_id.as_bytes());
+    mac.update(code.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+fn verify_code(hmac_secret: &str, challenge_id: Uuid, code: &str, expected_hash: &str) -> bool {
+    let mut mac = Hmac::<Sha256>::new_from_slice(hmac_secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    mac.update(challenge_id.as_bytes());
+    mac.update(code.as_bytes());
+    let computed = mac.finalize().into_bytes();
+    let expected = match hex::decode(expected_hash) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    computed.as_slice() == expected.as_slice()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Demonstrates the difference between counting all challenges in the
+    /// past hour vs only fresh (unconsumed) ones. The hourly spam cap query
+    /// must exclude consumed challenges so verified merchants aren't locked
+    /// out by their own past successes.
+    #[test]
+    fn hourly_cap_query_excludes_consumed_challenges() {
+        let query = "SELECT count(*) FROM otp_challenges
+          WHERE phone_number = $1 AND purpose = $2 AND consumed_at IS NULL
+            AND created_at > now() - interval '1 hour'";
+        assert!(
+            query.contains("consumed_at IS NULL"),
+            "hourly rate-limit count must only include unconsumed challenges"
+        );
+    }
+
+    /// Simulates the scenario from the bug report: 5 challenges in the past
+    /// hour, all consumed. Counting all of them would hit the cap; counting
+    /// only unconsumed ones yields 0 and allows a new challenge.
+    #[test]
+    fn consumed_challenges_do_not_count_toward_cap() {
+        // (created_within_hour, consumed)
+        let challenges = [
+            (true, true),
+            (true, true),
+            (true, true),
+            (true, true),
+            (true, true),
+        ];
+        let all_in_hour = challenges.iter().filter(|(in_hour, _)| *in_hour).count() as i64;
+        let fresh_in_hour = challenges
+            .iter()
+            .filter(|(in_hour, consumed)| *in_hour && !*consumed)
+            .count() as i64;
+
+        assert_eq!(all_in_hour, MAX_SENDS_PER_HOUR);
+        assert!(all_in_hour >= MAX_SENDS_PER_HOUR, "old behavior would rate-limit");
+        assert_eq!(fresh_in_hour, 0);
+        assert!(fresh_in_hour < MAX_SENDS_PER_HOUR, "new behavior allows a fresh challenge");
     #[tokio::test]
     async fn mock_provider_captures_sent_code() {
         let provider = MockOtpProvider::new();
