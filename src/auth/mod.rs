@@ -52,3 +52,4 @@ mod extractor_tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
+pub mod revocation;
