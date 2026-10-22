@@ -131,6 +131,14 @@ pub struct AppConfig {
     /// `Secure` on, `SameSite=Lax`. Browsers treat localhost as a secure
     /// context, so the defaults also work for local development over HTTP.
     pub cookie: CookieConfig,
+    /// Fraud-detection threshold: a single deposit above this many stroops is
+    /// still credited but flagged and logged at high severity. Defaults to
+    /// 10,000 XLM (100_000_000_000 stroops).
+    pub max_single_deposit_stroops: i64,
+    /// Fraud-detection threshold: total deposits for a merchant within a
+    /// rolling hour above this many stroops are flagged. Defaults to
+    /// 50,000 XLM (500_000_000_000 stroops).
+    pub max_hourly_deposit_stroops: i64,
     /// Maximum accepted request body size in bytes. Applied via
     /// `RequestBodyLimitLayer`; requests over this limit are rejected with a
     /// 413 before reaching a handler. Defaults to 64KB, which covers every
@@ -264,6 +272,8 @@ impl AppConfig {
                 secure: cookie_secure,
                 same_site: cookie_same_site,
             },
+            max_single_deposit_stroops: stroops("MAX_SINGLE_DEPOSIT_STROOPS", 100_000_000_000)?,
+            max_hourly_deposit_stroops: stroops("MAX_HOURLY_DEPOSIT_STROOPS", 500_000_000_000)?,
             max_request_body_bytes,
         })
     }
@@ -328,6 +338,19 @@ fn flag(name: &str, default: bool) -> Result<bool, String> {
             "1" | "true" | "yes" => Ok(true),
             "0" | "false" | "no" => Ok(false),
             other => Err(format!("{name} must be true or false, got `{other}`")),
+        },
+    }
+}
+
+/// Parses a positive stroop threshold from the environment, falling back to
+/// `default` when unset. Rejects zero/negative values so a typo can't silently
+/// disable anomaly detection.
+fn stroops(name: &str, default: i64) -> Result<i64, String> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(value) => match value.trim().parse::<i64>() {
+            Ok(v) if v > 0 => Ok(v),
+            _ => Err(format!("{name} must be a positive integer number of stroops, got `{value}`")),
         },
     }
 }
@@ -487,6 +510,8 @@ mod tests {
                     secure: true,
                     same_site: SameSite::Lax,
                 },
+                max_single_deposit_stroops: 100_000_000_000,
+                max_hourly_deposit_stroops: 500_000_000_000,
                 max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             }
         );

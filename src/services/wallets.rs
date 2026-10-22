@@ -207,10 +207,11 @@ pub async fn wallet_by_id(db: &PgPool, id: Uuid) -> Result<Option<Wallet>, sqlx:
 }
 
 pub async fn wallet_by_address(db: &PgPool, address: &str) -> Result<Option<Wallet>, sqlx::Error> {
-    sqlx::query_as::<_, Wallet>(
+    sqlx::query_as!(
+        Wallet,
         "SELECT id, merchant_id, address, network, created_at FROM wallets WHERE address = $1",
+        address
     )
-    .bind(address)
     .fetch_optional(db)
     .await
 }

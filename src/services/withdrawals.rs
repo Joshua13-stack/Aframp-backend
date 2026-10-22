@@ -66,6 +66,15 @@ pub enum WithdrawalError {
     Database(#[from] sqlx::Error),
 }
 
+#[tracing::instrument(
+    name = "withdrawals.create_withdrawal",
+    skip(db, provider, withdrawal),
+    fields(
+        merchant_id = %withdrawal.merchant_id,
+        asset = %withdrawal.asset,
+        amount_stroops = withdrawal.amount_stroops,
+    )
+)]
 /// Submit basic KYC information for a merchant. At least one identifier must be
 /// provided. On success the merchant's `kyc_status` moves to `pending` and the
 /// submitted values are recorded for admin review.
