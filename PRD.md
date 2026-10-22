@@ -165,12 +165,44 @@ When an open question above is resolved, record it here using this format. Appen
 ```
 
 ## 8. Success metrics
+A payment can still land without going through a request at all (manually, or via friendbot), and it will still be detected and credited — request correlation is an enhancement, not a requirement for detection.
+
+## 7. Planned features (not yet implemented)
+
+These are tracked here so the schema and models that anticipate them aren't mistaken for dead code. Nothing in this section is wired to an endpoint yet.
+
+### 7.1 API key authentication
+
+The `0001_init.sql` migration creates an `api_keys` table and `src/models/api_key.rs` defines an `ApiKey` model, but **no API key endpoints exist yet** — there is no way to create, list, or revoke a key, and no request path authenticates via API key. This is planned infrastructure for the Aframp API layer (third-party fintech integrations), not a working feature.
+
+Planned scope (tracked separately, including multi-environment keys):
+
+- `POST /api-keys` to mint a key for the authenticated merchant
+- `GET /api-keys` to list a merchant's keys (without exposing the secret)
+- `DELETE /api-keys/{id}` to revoke a key
+- API-key authentication as an alternative to JWT on merchant endpoints
+- Multi-environment keys (e.g. test vs. live) — see the related issue
+
+Until then, `WEBHOOK_SECRET` is used only for signing outbound webhooks; it is **not** an API key authentication mechanism.
+
+## 8. Success metrics
+
+- A merchant can go from signup to a confirmed, memo-correlated payment without leaving the API.
+- Every confirmed payment is traceable to a real Stellar transaction hash.
+- No merchant ever sees a balance that isn't backed by a detected on-chain deposit minus recorded withdrawals.
+
+## 9. Open decisions
+## 11. Risks
 
 *(To be defined — this section is a placeholder. The MVP's success will be measured by merchant activation and repeat payment volume, but no targets have been set yet.)*
 
 ## 9. Open decisions
 
 ### 9.1 Payout provider
+1. Settlement & payout pipeline: sweep merchant wallets → redeem cNGN via the issuer → last-mile payout via Paystack/Flutterwave (closes the "ledger says X, bank account has 0" gap — see §9.1). Full implementation plan in [`docs/settlement-sweep-wallet.md`](docs/settlement-sweep-wallet.md) (issue [#1276](https://github.com/kellymusk/Aframp-backend/issues/1276))
+2. Source a real cNGN issuer Stellar address (unblocks cNGN QR codes and cNGN-denominated payment requests — see §9.4)
+3. Confirmation-depth policy decision + implementation
+4. Cleanup: remove or repurpose `src/stellar/mod.rs`
 
 No real payout provider is wired in. `POST /withdraw` is ledger accounting only. The intended provider is Paystack (see [§7.1](#71-intended-flow) for how it fits the cNGN flow); the integration itself is not built.
 
@@ -185,3 +217,8 @@ No real cNGN issuer address is configured, so credit-asset payment requests retu
 ### 9.4 Ledger confirmation threshold
 
 Detected payments are confirmed immediately; there is no "wait N ledger confirmations" threshold yet (open TODO in `blockchain/worker.rs`).
+1. **Settlement sweeping** — when and how funds move from per-merchant wallets to a platform settlement wallet.
+2. **Confirmation depth** — how many ledger confirmations count as "confirmed" (currently immediate).
+3. **cNGN issuer** — which issuer address to trust for cNGN on testnet/mainnet.
+4. **Payout provider** — which provider actually moves fiat for withdrawals.
+5. **API key environments** — whether keys are scoped per environment or per merchant (see [§7.1](#71-api-key-authentication)).
