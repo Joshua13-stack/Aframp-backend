@@ -39,6 +39,23 @@ fn limit(params: &ListParams) -> i64 {
     params.limit.unwrap_or(100).clamp(1, 500)
 }
 
+/// Financial data (balances, withdrawals) is restricted to `super_admin` and
+/// `finance` admins. Other admin roles get a 403.
+fn require_finance(admin: &AdminUser) -> ApiResult<()> {
+    if admin.has_role(&["super_admin", "finance"]) {
+        Ok(())
+    } else {
+        Err(crate::error::ApiError::Forbidden)
+    }
+}
+
+/// PII-heavy data (user emails) is restricted to `super_admin` and `support`
+/// admins. Other admin roles get a 403.
+fn require_pii(admin: &AdminUser) -> ApiResult<()> {
+    if admin.has_role(&["super_admin", "support"]) {
+        Ok(())
+    } else {
+        Err(crate::error::ApiError::Forbidden)
 /// Validate the `X-CSRF-Token` header on state-changing admin requests.
 ///
 /// The dashboard embeds a per-session token in a `<meta name="csrf-token">`
@@ -65,15 +82,16 @@ fn cursor(params: &ListParams) -> ApiResult<Option<Cursor>> {
 
 pub async fn overview(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
 ) -> ApiResult<Json<AdminOverview>> {
+    require_finance(&admin)?;
     let overview = admin::overview(&state.db).await.map_err(internal)?;
     Ok(Json(overview))
 }
 
 pub async fn users(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Page<AdminUserRow>>> {
     let page = admin::users(&state.db, limit(&params), cursor(&params)?)
@@ -81,6 +99,8 @@ pub async fn users(
         .map_err(internal)?;
     Ok(Json(page))
 ) -> ApiResult<Json<Vec<AdminUserRow>>> {
+    require_pii(&admin)?;
+    let rows = admin::users(&state.db, limit(&params)).await.map_err(internal)?;
     let rows = admin::users(&state.db, params.admin_limit()).await.map_err(internal)?;
     Ok(Json(rows))
 }
@@ -150,7 +170,7 @@ pub async fn transactions(
 
 pub async fn withdrawals(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<Page<AdminWithdrawalRow>>> {
     let page = admin::withdrawals(&state.db, limit(&params), cursor(&params)?)
@@ -158,6 +178,8 @@ pub async fn withdrawals(
         .map_err(internal)?;
     Ok(Json(page))
 ) -> ApiResult<Json<Vec<AdminWithdrawalRow>>> {
+    require_finance(&admin)?;
+    let rows = admin::withdrawals(&state.db, limit(&params)).await.map_err(internal)?;
     let rows = admin::withdrawals(&state.db, params.admin_limit()).await.map_err(internal)?;
     Ok(Json(rows))
 }
