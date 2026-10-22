@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use aframp::{build_state, router, AppConfig};
 use axum::http::{header, HeaderValue, Method};
+use tokio::sync::CancellationToken;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -53,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
     let state = Arc::new(build_state(&config).await?);
 
+    let shutdown = CancellationToken::new();
     // Channel used to signal the blockchain worker to stop on shutdown.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -60,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.clone(),
         config.stellar_horizon_url.clone(),
         config.stellar_poll_interval_secs,
+        shutdown.clone(),
     );
     let worker_handle = tokio::spawn(worker);
 
@@ -141,6 +144,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let address: SocketAddr = config.bind_addr.parse()?;
     tracing::info!(%address, "aframp started");
+
+    let server_shutdown = shutdown.clone();
+    axum::serve(tokio::net::TcpListener::bind(address).await?, app)
+        .with_graceful_shutdown(shutdown_signal(server_shutdown))
+        .await?;
+
+    // Ensure the worker observes the cancellation and exits cleanly.
+    shutdown.cancel();
+    if let Err(err) = worker_handle.await {
+        tracing::error!(%err, "blockchain worker task failed to join");
+    }
+
+    Ok(())
+}
+
+/// Resolves when the process receives SIGTERM or Ctrl-C, then cancels the
+/// shared token so the blockchain worker can terminate gracefully.
+async fn shutdown_signal(token: CancellationToken) {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(%err, "failed to install Ctrl-C handler");
+        }
     tracing::info!("blockchain worker running");
 
     let shutdown_tx = shutdown_tx.clone();
@@ -172,6 +197,15 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
 
     #[cfg(unix)]
     let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::error!(%err, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("failed to install SIGTERM handler")
             .recv()
@@ -186,6 +220,8 @@ async fn shutdown_signal(shutdown_tx: watch::Sender<bool>) {
         _ = terminate => {}
     }
 
+    tracing::info!("shutdown signal received, cancelling blockchain worker");
+    token.cancel();
     tracing::info!("shutdown signal received, stopping worker");
     let _ = shutdown_tx.send(true);
 }
