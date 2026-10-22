@@ -23,8 +23,28 @@ use crate::models::{
     AdminWalletRow, AdminWithdrawalRow, ListParams,
     AdminWalletRow, AdminWithdrawalRow, Merchant,
 };
+use crate::pagination::{Cursor, Page};
 use crate::services::admin;
 use crate::AppState;
+
+#[derive(Deserialize)]
+pub struct ListParams {
+    pub limit: Option<i64>,
+    pub cursor: Option<String>,
+}
+
+fn limit(params: &ListParams) -> i64 {
+    params.limit.unwrap_or(100).clamp(1, 500)
+}
+
+fn cursor(params: &ListParams) -> ApiResult<Option<Cursor>> {
+    match params.cursor.as_deref() {
+        Some(raw) => Cursor::decode(raw)
+            .map(Some)
+            .map_err(|_| crate::error::ApiError::bad_request("invalid cursor")),
+        None => Ok(None),
+    }
+}
 
 pub async fn overview(
     State(state): State<AppState>,
@@ -38,6 +58,11 @@ pub async fn users(
     State(state): State<AppState>,
     _admin: AdminUser,
     Query(params): Query<ListParams>,
+) -> ApiResult<Json<Page<AdminUserRow>>> {
+    let page = admin::users(&state.db, limit(&params), cursor(&params)?)
+        .await
+        .map_err(internal)?;
+    Ok(Json(page))
 ) -> ApiResult<Json<Vec<AdminUserRow>>> {
     let rows = admin::users(&state.db, params.admin_limit()).await.map_err(internal)?;
     Ok(Json(rows))
@@ -47,6 +72,11 @@ pub async fn merchants(
     State(state): State<AppState>,
     _admin: AdminUser,
     Query(params): Query<ListParams>,
+) -> ApiResult<Json<Page<AdminMerchantRow>>> {
+    let page = admin::merchants(&state.db, limit(&params), cursor(&params)?)
+        .await
+        .map_err(internal)?;
+    Ok(Json(page))
 ) -> ApiResult<Json<Vec<AdminMerchantRow>>> {
     let rows = admin::merchants(&state.db, params.admin_limit()).await.map_err(internal)?;
     Ok(Json(rows))
@@ -77,6 +107,11 @@ pub async fn wallets(
     State(state): State<AppState>,
     _admin: AdminUser,
     Query(params): Query<ListParams>,
+) -> ApiResult<Json<Page<AdminWalletRow>>> {
+    let page = admin::wallets(&state.db, limit(&params), cursor(&params)?)
+        .await
+        .map_err(internal)?;
+    Ok(Json(page))
 ) -> ApiResult<Json<Vec<AdminWalletRow>>> {
     let rows = admin::wallets(&state.db, params.admin_limit()).await.map_err(internal)?;
     Ok(Json(rows))
@@ -86,6 +121,11 @@ pub async fn transactions(
     State(state): State<AppState>,
     _admin: AdminUser,
     Query(params): Query<ListParams>,
+) -> ApiResult<Json<Page<AdminTransactionRow>>> {
+    let page = admin::transactions(&state.db, limit(&params), cursor(&params)?)
+        .await
+        .map_err(internal)?;
+    Ok(Json(page))
 ) -> ApiResult<Json<Vec<AdminTransactionRow>>> {
     let rows = admin::transactions(&state.db, params.admin_limit()).await.map_err(internal)?;
     Ok(Json(rows))
@@ -95,6 +135,11 @@ pub async fn withdrawals(
     State(state): State<AppState>,
     _admin: AdminUser,
     Query(params): Query<ListParams>,
+) -> ApiResult<Json<Page<AdminWithdrawalRow>>> {
+    let page = admin::withdrawals(&state.db, limit(&params), cursor(&params)?)
+        .await
+        .map_err(internal)?;
+    Ok(Json(page))
 ) -> ApiResult<Json<Vec<AdminWithdrawalRow>>> {
     let rows = admin::withdrawals(&state.db, params.admin_limit()).await.map_err(internal)?;
     Ok(Json(rows))
@@ -104,11 +149,13 @@ pub async fn payment_requests(
     State(state): State<AppState>,
     _admin: AdminUser,
     Query(params): Query<ListParams>,
+) -> ApiResult<Json<Page<AdminPaymentRequestRow>>> {
+    let page = admin::payment_requests(&state.db, limit(&params), cursor(&params)?)
 ) -> ApiResult<Json<Vec<AdminPaymentRequestRow>>> {
     let rows = admin::payment_requests(&state.db, params.admin_limit())
         .await
         .map_err(internal)?;
-    Ok(Json(rows))
+    Ok(Json(page))
 }
 
 /// Server-Sent Events stream of live admin activity. Protected by `AdminUser`,

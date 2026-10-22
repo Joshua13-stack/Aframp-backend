@@ -21,6 +21,12 @@ use crate::services::users;
 use crate::validation::{is_valid_email, normalize_ng_phone_number, validate_name};
 use crate::AppState;
 
+/// A precomputed Argon2 hash used only to burn the same amount of CPU as a
+/// real password verification when the account doesn't exist. This keeps the
+/// "unknown email" and "wrong password" paths roughly constant-time, closing
+/// the username-enumeration timing oracle. The plaintext is irrelevant — the
+/// verification is expected to fail; we only care about the work it does.
+const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
 /// Maximum failed login attempts allowed per email within the window.
 const LOGIN_MAX_ATTEMPTS: usize = 10;
 /// Length of the sliding window over which attempts are counted.
@@ -111,6 +117,17 @@ pub async fn login(
     if !is_valid_email(&req.email) {
         return Err(bad_request_field("email", "must be a valid email address"));
     }
+    let (user, merchant) = match users::login(&state.db, &req.email, &req.password).await {
+        Ok(found) => found,
+        Err(UserError::InvalidCredentials) => {
+            // Equalize timing: run a dummy Argon2 verification so the
+            // "unknown email" path costs the same as a real "wrong password"
+            // check, preventing username enumeration via response time.
+            let _ = password::verify(DUMMY_PASSWORD_HASH, &req.password);
+            return Err(map_user_error(UserError::InvalidCredentials));
+        }
+        Err(err) => return Err(map_user_error(err)),
+    };
 
     if let Err(retry_after) = check_login_rate_limit(&req.email).await {
         return Err(rate_limited(retry_after));
